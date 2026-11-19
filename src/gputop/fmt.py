@@ -11,7 +11,7 @@ def superscript(n: int) -> str:
 
 def short_gpu_name(name: str) -> str:
     """'NVIDIA GeForce RTX 4090' -> 'RTX 4090'."""
-    for prefix in ("NVIDIA GeForce ", "NVIDIA ", "GeForce ", "AMD Radeon ", "Intel(R) "):
+    for prefix in ("NVIDIA GeForce ", "NVIDIA ", "GeForce ", "AMD Radeon ", "Intel(R) ", "Intel "):
         if name.startswith(prefix):
             return name[len(prefix):]
     return name

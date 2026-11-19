@@ -89,16 +89,19 @@ class TopBar(LinesWidget):
         return line
 
 
-def overview_layout(n: int, width: int, height: int) -> tuple[int, int, int]:
+def overview_layout(n: int, width: int, height: int, with_table: bool = True) -> tuple[int, int, int]:
     """(columns, rows, panel_height) for ``n`` GPU panels in ``width``x``height``.
 
     Panels are at least ``PANEL_MIN_WIDTH`` wide. Their height shrinks towards
     3 rows (1 content line) on small terminals and grows up to 12 on tall ones
-    so graphs get taller, always leaving room for the process table.
+    so graphs get taller, always leaving room for the process table. Without
+    a process table (no device has per-process data) panels fill the height.
     """
     n = max(1, n)
     cols = max(1, min(n, width // PANEL_MIN_WIDTH))
     rows = math.ceil(n / cols)
+    if not with_table:
+        return cols, rows, max(3, height // rows)
     avail = max(3 * rows, height - PROC_MIN_HEIGHT)
     ideal = max(6, min(12, (height * 55 // 100) // rows))
     ph = max(3, min(ideal, avail // rows))
@@ -229,6 +232,7 @@ class GpuTopApp(App[None]):
         self.set_interval(1.0, self.update_header)
         if self.detail_mode:
             self.call_after_refresh(self._enter_detail)
+        self.call_after_refresh(self._sync_table_visibility)
         self.call_after_refresh(self.relayout)
         self.sampler.start()
 
@@ -246,6 +250,44 @@ class GpuTopApp(App[None]):
         if self._detail is not None:
             self._detail.update_data()
         self.table.set_processes(self.sampler.all_processes())
+        self._sync_table_visibility()
+        cap = self._panel_cap()
+        if cap != getattr(self, "_last_cap", None):
+            self._last_cap = cap
+            self._last_layout = None
+            self.relayout()
+
+    def _panel_cap(self) -> int | None:
+        """Max useful panel content height if no panel has graphs, else None."""
+        caps = [p.max_content_rows() for p in self.panels]
+        if not caps or any(c is None for c in caps):
+            return None
+        return max(caps)
+
+    def _table_wanted(self) -> bool:
+        """Show the process table only if a GPU in view has per-process data
+        (hidden e.g. for Intel GPUs on kernels without DRM fdinfo)."""
+        if self.detail_mode and self.panels:
+            scope = [self.panels[self.focus_pos].state]
+        else:
+            scope = [p.state for p in self.panels]
+        backend = self.sampler.backend
+        for state in scope:
+            try:
+                if backend.supports_processes(state.info):
+                    return True
+            except Exception:  # lost device etc.: don't let it hide the table
+                return True
+        return not scope
+
+    def _sync_table_visibility(self) -> None:
+        if not self._live:
+            return
+        wanted = self._table_wanted()
+        if self.table.display != wanted:
+            self.table.display = wanted
+            self._last_layout = None
+            self.call_after_refresh(self.relayout)
 
     # -- layout ---------------------------------------------------------------
 
@@ -262,14 +304,19 @@ class GpuTopApp(App[None]):
         # History must cover the widest possible graph (2 samples per cell).
         if self.sampler.history_len < w * 2:
             self.sampler.set_history_len(w * 2 + 64)
-        cols, rows, ph = overview_layout(len(self.panels), w, h)
-        key = (w, h, cols, rows, ph, self.detail_mode)
+        with_table = bool(self.table.display)
+        cols, rows, ph = overview_layout(len(self.panels), w, h, with_table)
+        cap = self._panel_cap()
+        if cap is not None:
+            ph = min(ph, cap + 2)  # + border
+        key = (w, h, cols, rows, ph, self.detail_mode, with_table)
         if key != self._last_layout:
             self._last_layout = key
             overview = self.overview
             overview.styles.grid_size_columns = cols
             overview.set_styles(f"grid-rows: {ph};")
-            overview.styles.height = min(rows * ph, max(3, h - PROC_MIN_HEIGHT))
+            reserve = PROC_MIN_HEIGHT if with_table else 0
+            overview.styles.height = min(rows * ph, max(3, h - reserve))
             if self._detail is not None:
                 self._detail.set_columns(3 if w >= 110 or h < 30 else 2)
         self.update_header()
@@ -397,6 +444,7 @@ class GpuTopApp(App[None]):
         overview.display = False
         host.display = True
         self.table.set_gpu_filter(state.index)
+        self._sync_table_visibility()
         self.update_header()
 
     def _exit_detail(self) -> None:
@@ -407,6 +455,7 @@ class GpuTopApp(App[None]):
         self.detail_host.display = False
         self.overview.display = True
         self.table.set_gpu_filter(None)
+        self._sync_table_visibility()
         self.update_header()
 
     # -- process table --------------------------------------------------------

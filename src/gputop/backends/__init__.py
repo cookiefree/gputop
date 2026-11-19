@@ -15,7 +15,11 @@ from .base import (
     GPUSample,
 )
 
-BACKEND_NAMES = ("nvidia", "fake", "amd")
+BACKEND_NAMES = ("nvidia", "intel", "auto", "fake", "amd")
+
+# Backends tried by ``--backend auto``, in display order. The AMD stub and the
+# fake backend are not included (add "amd" here once it is implemented).
+AUTO_BACKENDS = ("nvidia", "intel")
 
 
 def create_backend(name: str, **options: Any) -> GPUBackend:
@@ -26,6 +30,14 @@ def create_backend(name: str, **options: Any) -> GPUBackend:
         from .nvidia import NvidiaBackend
 
         return NvidiaBackend()
+    if name == "intel":
+        from .intel import IntelBackend
+
+        return IntelBackend(**options)
+    if name == "auto":
+        from .composite import CompositeBackend
+
+        return CompositeBackend([(n, lambda n=n: create_backend(n)) for n in AUTO_BACKENDS])
     if name == "fake":
         from .fake import FakeBackend
 
@@ -38,6 +50,7 @@ def create_backend(name: str, **options: Any) -> GPUBackend:
 
 
 __all__ = [
+    "AUTO_BACKENDS",
     "BACKEND_NAMES",
     "THROTTLE_LABELS",
     "THROTTLE_WARNING",

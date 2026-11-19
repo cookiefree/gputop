@@ -48,7 +48,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--theme", metavar="NAME", help="theme name or path to a .theme/.toml file")
     p.add_argument("--gpu", type=_gpu_list, metavar="INDEX[,INDEX...]", help="only show these GPUs")
     p.add_argument("--no-mouse", action="store_true", help="disable mouse support")
-    p.add_argument("--backend", choices=BACKEND_NAMES, help="data source (default nvidia; 'fake' needs no GPU)")
+    p.add_argument("--backend", choices=BACKEND_NAMES,
+                   help="data source: nvidia (default), intel, auto (every available backend), "
+                        "fake (synthetic, no GPU needed)")
     p.add_argument("--color", choices=("auto", "truecolor", "256", "16"),
                    help="force a colour mode (default: detect from $COLORTERM/$TERM)")
     p.add_argument("--fake-gpus", type=int, default=2, metavar="N", help="number of GPUs for --backend fake")
@@ -72,6 +74,8 @@ def _open_backend(name: str, args: argparse.Namespace) -> GPUBackend:
 
 
 def cmd_list(sampler: Sampler) -> int:
+    for name, reason in getattr(sampler.backend, "skipped", {}).items():
+        print(f"gputop: note: {name} backend skipped: {reason}", file=sys.stderr)
     devices = sampler.devices
     if not devices:
         print("no GPUs found")
@@ -104,7 +108,11 @@ def cmd_once(sampler: Sampler, backend_name: str) -> int:
                 "error": dev.error,
             }
         )
-    json.dump({"timestamp": time.time(), "backend": backend_name, "gpus": gpus}, sys.stdout, indent=2)
+    out: dict = {"timestamp": time.time(), "backend": backend_name, "gpus": gpus}
+    active = getattr(sampler.backend, "active", None)
+    if active is not None:  # --backend auto
+        out["backends"] = [name for name, _ in active]
+    json.dump(out, sys.stdout, indent=2)
     sys.stdout.write("\n")
     return 0
 
@@ -174,7 +182,7 @@ def run_tui(args: argparse.Namespace, cfg: Config, cfg_path: Path | None, sample
     # Textual is imported lazily so --list/--once stay fast and dependency-light.
     from .app import GpuTopApp
 
-    label = backend_name
+    label = getattr(sampler.backend, "label", backend_name)
     if sampler.devices and sampler.devices[0].info.driver_version:
         label = f"{backend_name} {sampler.devices[0].info.driver_version.split()[0]}"
     app = GpuTopApp(sampler, themes, theme.name, cfg, backend_label=label)

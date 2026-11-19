@@ -253,3 +253,87 @@ def test_overview_layout_math():
     assert overview_layout(1, 300, 100)[2] == 12
     # narrow: one column
     assert overview_layout(3, 50, 40)[0] == 1
+
+
+# -- Intel / mixed-vendor UI behaviour ------------------------------------------------
+
+
+def make_intel_app(tmp_path, with_clients=False, with_nvidia=False, pmu_denied=True):
+    from fake_backend import ScriptedBackend
+    from fake_sysfs import FakeSysfs, drm_fdinfo
+    from gputop.backends.base import GPUProcess
+    from gputop.backends.composite import CompositeBackend
+    from gputop.backends.intel import IntelBackend
+
+    tree = FakeSysfs(tmp_path)
+    tree.add_card(0, pci="0000:00:02.0")
+    tree.add_coretemp()
+    tree.add_pmu()
+    if pmu_denied:
+        tree.pmu_error = 13  # EACCES
+    if with_clients:
+        tree.add_proc(50, "kitty", ["kitty"], {3: ("/dev/dri/renderD128", drm_fdinfo())})
+    intel = IntelBackend(root=tree.root, counter_opener=tree.open_counter, clock=tree.clock)
+    if with_nvidia:
+        cuda_app = GPUProcess(pid=9, gpu_index=0, vram_used=1 << 30, user="u", command="cuda-app")
+        nv = ScriptedBackend(count=1, processes={0: [cuda_app]})
+        backend = CompositeBackend([("nvidia", lambda: nv), ("intel", lambda: intel)])
+    else:
+        backend = intel
+    sampler = Sampler(backend, interval=0.1, resolve_processes=False)
+    sampler.discover()
+    for _ in range(3):
+        sampler.poll_once()
+    return GpuTopApp(sampler, available_themes(None), "default", backend_label="test")
+
+
+def test_intel_igpu_panel_hides_vram_and_shows_hint(tmp_path):
+    async def scenario(pilot, app):
+        text = screen_text(app)
+        assert "vram" not in text  # shared memory: no fake VRAM bar
+        assert "util hidden: needs kernel.perf_event_paranoid=0" in text
+        assert "temp 61°C" in text
+        # no fdinfo clients: process table hidden entirely
+        assert not app.table.display
+        assert "processes" not in text
+        await pilot.press("a")
+        await pilot.pause(0.3)
+        text = screen_text(app)
+        assert "⚠ util hidden" in text
+        boxes = [b for b in app.query("MetricBox") if b.display]
+        titles = " ".join(str(b.border_title) for b in boxes)
+        assert "temp" in titles and "gfx" in titles
+        assert "vram" not in titles and "pcie" not in titles and "util" not in titles
+        assert not app.table.display
+
+    run(make_intel_app(tmp_path), scenario)
+
+
+def test_intel_with_fdinfo_shows_table_without_empty_columns(tmp_path):
+    async def scenario(pilot, app):
+        assert app.table.display
+        text = screen_text(app)
+        assert "kitty" in text
+        header = next(line for line in text.splitlines() if "PID" in line)
+        assert "VRAM" not in header and "SM%" not in header  # all-empty columns hidden
+        assert "TYPE" in header
+
+    run(make_intel_app(tmp_path, with_clients=True), scenario)
+
+
+def test_mixed_vendors_table_follows_focused_gpu(tmp_path):
+    async def scenario(pilot, app):
+        assert len(app.panels) == 2
+        assert app.table.display  # the NVIDIA-like GPU has processes
+        assert "cuda-app" in screen_text(app)
+        await pilot.press("2", "a")  # detail view of the Intel GPU
+        await pilot.pause(0.3)
+        assert app.detail_mode and not app.table.display
+        await pilot.press("1")  # back to the other GPU, still in detail view
+        await pilot.pause(0.3)
+        assert app.table.display
+        await pilot.press("a")
+        await pilot.pause(0.3)
+        assert app.table.display and "cuda-app" in screen_text(app)
+
+    run(make_intel_app(tmp_path, with_nvidia=True), scenario)

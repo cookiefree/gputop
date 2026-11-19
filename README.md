@@ -39,14 +39,17 @@ support and themes. It handles any number of GPUs at once.
   C+G). Sort by any column, reverse, filter by text, scroll.
 - Metrics a card or driver doesn't support (per-process utilisation, power limit
   on laptops, fan on passively cooled cards…) are simply hidden.
+- **NVIDIA** (NVML) and **Intel** (i915 sysfs + perf PMU) backends; `--backend
+  auto` shows every GPU from every available backend side by side.
 - Truecolor with automatic 256-colour fallback; works over SSH and in tmux.
 - Themes: `default`, `dracula`, `gruvbox`, `nord`, plus your own (btop `.theme`
   files work as-is).
 
 ## Install
 
-Requires Python 3.11+ and Linux. For real data you need the proprietary NVIDIA
-driver (which provides `libnvidia-ml.so`).
+Requires Python 3.11+ and Linux. For NVIDIA GPUs you need the proprietary
+NVIDIA driver (which provides `libnvidia-ml.so`); Intel GPUs need nothing extra
+(see [Intel GPUs](#intel-gpus) for optional permissions).
 
 ```sh
 pipx install .            # from a checkout of this repository
@@ -66,7 +69,7 @@ gputop --backend fake --fake-gpus 4
 
 ```
 gputop [--interval MS] [--theme NAME] [--gpu INDEX[,INDEX...]] [--no-mouse]
-       [--backend {nvidia,fake,amd}] [--color {auto,truecolor,256,16}]
+       [--backend {nvidia,intel,auto,fake,amd}] [--color {auto,truecolor,256,16}]
 gputop --list      # print detected GPUs and exit
 gputop --once      # print one snapshot as JSON and exit (for scripting)
 ```
@@ -81,6 +84,40 @@ gputop --once | jq '.gpus[] | {name: .info.name, util: .sample.util_gpu}'
 
 Exit codes: `0` ok, `1` no usable backend/GPU (e.g. NVML missing), `2` bad
 arguments.
+
+`--backend auto` tries every real backend (NVIDIA, Intel), uses all that find
+a GPU and numbers their devices 0..N-1; `--list` notes which backends were
+skipped and why. To make it the default, set `backend = "auto"` in the config.
+
+### Intel GPUs
+
+`--backend intel` (or `auto`) reads integrated and discrete Intel GPUs (i915,
+partial xe) **read-only**, without root:
+
+| Metric | Source | If unavailable |
+| --- | --- | --- |
+| frequency | `gt_act_freq_mhz` (actual), `gt_cur_freq_mhz`, `gt_max_freq_mhz` | hidden |
+| utilisation, per-engine busy | i915 perf PMU `*-busy` counters (as `intel_gpu_top`) | hidden, with a one-line hint |
+| power | RAPL GPU domain (`uncore`), else CPU package (labelled); hwmon energy on discrete cards | hidden |
+| temperature | coretemp "Package id 0" (iGPU), card hwmon (discrete) | hidden |
+| processes | `/proc/PID/fdinfo` `drm-*` keys (kernel ≥ 5.19) | process table hidden for that GPU |
+
+Integrated GPUs share system memory, so there is **no VRAM bar** for them.
+
+Most distros restrict both counters by default:
+
+- **Utilisation** needs system-wide perf access. Either allow it for everyone
+  (`sudo sysctl kernel.perf_event_paranoid=0`, persist in `/etc/sysctl.d/`) or
+  give only the Python interpreter that runs gputop the capability
+  (`sudo setcap cap_perfmon=ep "$(readlink -f "$(which python3)")"`; note this
+  applies to every script run with that interpreter, so prefer a dedicated venv).
+- **Power** via RAPL is root-only since 2020 (`energy_uj` is mode 0400). gputop
+  simply hides it; you can `chmod a+r` the `intel-rapl` `energy_uj` files at
+  boot (e.g. a udev rule) if you accept the side-channel risk.
+
+Per-process engine busy % needs Gen8+ GPUs (older ones list clients without
+SM%), and only your own processes' fdinfo is readable without root. DRM
+clients are rediscovered every 5 seconds.
 
 ### Keys
 
@@ -178,6 +215,8 @@ src/gputop/
 ├── backends/
 │   ├── base.py          GPUBackend ABC + GPUInfo / GPUSample / GPUProcess
 │   ├── nvidia.py        NVML implementation
+│   ├── intel.py         i915/xe via sysfs, perf PMU, RAPL, hwmon, fdinfo
+│   ├── composite.py     --backend auto: several backends side by side
 │   ├── fake.py          synthetic multi-GPU backend (--backend fake)
 │   └── amd.py           documented stub with an implementation plan
 └── widgets/
@@ -199,7 +238,9 @@ src/gputop/
   others keep updating. A process that exits between NVML reporting it and the
   psutil lookup is shown as `?` / `[pid]` rather than crashing.
 - **Adding a vendor** means writing one `GPUBackend` subclass; nothing in the UI
-  changes. See `backends/amd.py` for the AMD plan (amdsmi or sysfs/hwmon).
+  changes. Metrics a backend reports as `None` are hidden, `GPUSample.notes`
+  carries user-facing hints, and `supports_processes()` hides the process table
+  for devices without per-process data. See `backends/amd.py` for the AMD plan (amdsmi or sysfs/hwmon).
 
 ## Development
 
@@ -211,7 +252,9 @@ gputop --backend fake --fake-gpus 3      # run the UI on synthetic data
 ```
 
 The test suite covers the braille renderer, meters, ring buffers and the
-sampler (including GPU loss and vanished processes), themes, config, the CLI,
+sampler (including GPU loss and vanished processes), the NVIDIA backend against
+a mocked NVML, the Intel backend against a fake sysfs/procfs tree
+(`tests/fake_sysfs.py`), `--backend auto`, themes, config, the CLI,
 and the UI itself driven headless through Textual's pilot (keys, mouse, resize,
 filter, detail view, GPU loss mid-run).
 

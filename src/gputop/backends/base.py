@@ -101,6 +101,14 @@ class GPUSample:
     enc_util: float | None = None
     dec_util: float | None = None
 
+    # Busy % per engine for GPUs that report engines separately (Intel:
+    # render, copy, video, ...). ``None`` when not reported.
+    engine_util: dict[str, float] | None = None
+
+    # One-line hints for the user about hidden metrics, e.g. missing
+    # permissions ("GPU util hidden: needs perf access ...").
+    notes: tuple[str, ...] = ()
+
     @property
     def mem_percent(self) -> float | None:
         if self.mem_used is None or not self.mem_total:
@@ -117,6 +125,7 @@ class GPUSample:
         data = asdict(self)
         if data["throttle_reasons"] is not None:
             data["throttle_reasons"] = list(data["throttle_reasons"])
+        data["notes"] = list(data["notes"])
         data["mem_percent"] = self.mem_percent
         return data
 
@@ -201,6 +210,14 @@ class GPUBackend(ABC):
     @abstractmethod
     def get_processes(self, device: GPUInfo) -> list[GPUProcess]:
         """Return the processes currently using ``device``."""
+
+    def supports_processes(self, device: GPUInfo) -> bool:
+        """Whether per-process data exists for ``device`` at all.
+
+        The UI hides the process table for devices where this is False
+        (e.g. Intel without DRM fdinfo), rather than showing an empty list.
+        """
+        return True
 
     def __enter__(self) -> GPUBackend:
         self.init()

@@ -263,6 +263,12 @@ class ProcessTable(LinesWidget, can_focus=False):
         if w <= 0 or h <= 0:
             return Text("")
         hide = set() if self.show_gpu_column else {"gpu"}
+        # Columns no listed process has data for (e.g. VRAM and SM% for Intel
+        # iGPU clients) are hidden instead of filled with dashes.
+        if self.rows and all(p.vram_used is None for p in self.rows):
+            hide.add("vram")
+        if self.rows and all(p.sm_util is None for p in self.rows):
+            hide.add("sm")
         self._layout = layout_columns(w, hide)
         lines = [self._header(th)]
         if not self.rows:

@@ -129,26 +129,43 @@ class GpuPanel(LinesWidget):
     # -- rendering ------------------------------------------------------------
 
     def _plan_rows(self, s: GPUSample, h: int) -> tuple[list[str], int, int]:
+        has_util = s.util_gpu is not None
         available = {
-            "util": True,
-            "vram": True,
+            "util": has_util,
+            # When utilisation is unavailable, a one-line hint explains why.
+            "hint": not has_util and bool(s.notes),
+            # No VRAM row for GPUs without dedicated memory (Intel iGPUs).
+            "vram": s.mem_total is not None,
             "status": True,
             "power": s.power_draw is not None,
             "pcie": s.pcie_rx is not None or s.pcie_tx is not None,
-            "mctl": s.util_mem is not None or s.enc_util is not None or s.dec_util is not None,
+            "mctl": s.util_mem is not None or s.enc_util is not None or s.dec_util is not None
+            or bool(s.engine_util),
             "clocks": s.clock_graphics is not None or s.clock_mem is not None,
         }
-        priority = ["util", "vram", "status", "power", "pcie", "mctl", "clocks"]
+        priority = ["util", "hint", "vram", "status", "power", "pcie", "mctl", "clocks"]
         chosen = [r for r in priority if available[r]][: max(1, h)]
-        order = ["util", "vram", "power", "status", "mctl", "pcie", "clocks"]
+        order = ["util", "hint", "vram", "power", "status", "mctl", "pcie", "clocks"]
         rows = [r for r in order if r in chosen]
         extra = max(0, h - len(rows))
-        if "power" in rows:
+        if "util" in rows and "power" in rows:
             util_h = 1 + extra - extra // 2
             power_h = 1 + extra // 2
-        else:
+        elif "util" in rows:
             util_h, power_h = 1 + extra, 1
+        else:
+            util_h, power_h = 1, 1 + extra
         return rows, util_h, power_h
+
+    def max_content_rows(self) -> int | None:
+        """Rows this panel can use, or None if it can grow (has graphs)."""
+        s = self.state.latest
+        if s is None or self.state.lost:
+            return None
+        rows, _, _ = self._plan_rows(s, 99)
+        if "util" in rows or "power" in rows:
+            return None
+        return len(rows)
 
     def render_text(self) -> Text:
         w, h = self.content_size
@@ -171,7 +188,12 @@ class GpuPanel(LinesWidget):
         util_v = fmt.pct(s.util_gpu)
         vram_v = fmt.mem_pair(s.mem_used, s.mem_total)
         pwr_v = fmt.power_pair(s.power_draw, s.power_limit)
-        vw = max(len(util_v), len(vram_v), len(pwr_v) if s.power_draw is not None else 0)
+        vw = max(
+            len(util_v) if s.util_gpu is not None else 0,
+            len(vram_v) if s.mem_total is not None else 0,
+            len(pwr_v) if s.power_draw is not None else 0,
+            4,
+        )
         bar_w = max(1, w - LABEL_W - 1 - vw)
 
         rows, util_h, power_h = self._plan_rows(s, h)
@@ -189,6 +211,11 @@ class GpuPanel(LinesWidget):
         for r in rows:
             if r == "util":
                 graph_rows("util", st.history["util_gpu"].tail(bar_w * 2), util_h, 100.0, "util", util_v)
+            elif r == "hint":
+                line = Text(no_wrap=True)
+                line.append("⚠ ", th.style("hi_fg"))
+                line.append(fmt.truncate(s.notes[0], w - 2), th.style("inactive_fg"))
+                lines.append(line)
             elif r == "vram":
                 line = Text(no_wrap=True, overflow="crop")
                 line.append("vram".ljust(LABEL_W), label)
@@ -209,6 +236,8 @@ class GpuPanel(LinesWidget):
                     parts.append(("enc ", s.enc_util))
                 if s.dec_util is not None:
                     parts.append(("dec ", s.dec_util))
+                for name, v in (s.engine_util or {}).items():
+                    parts.append((name + " ", v))
                 line = Text(no_wrap=True, overflow="crop")
                 for i, (name, v) in enumerate(parts):
                     if i:
@@ -283,9 +312,11 @@ class MetricBox(BrailleGraph):
     }
     """
 
-    def __init__(self, title_fn: Callable[[], tuple[Text, Text | None]], *args, **kwargs) -> None:
+    def __init__(self, title_fn: Callable[[], tuple[Text, Text | None]], *args, metrics: tuple[str, ...] = (),
+                 **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.title_fn = title_fn
+        self.metrics = metrics  # history keys; the box hides while all are empty
 
     def apply_theme(self, theme: Theme) -> None:
         self.gputop_theme = theme
@@ -316,6 +347,19 @@ class GpuInfoBar(LinesWidget):
         super().__init__(**kwargs)
         self.state = state
         self.gputop_theme = theme
+
+    @property
+    def notes(self) -> tuple[str, ...]:
+        s = self.state.latest
+        return s.notes if s is not None and not self.state.lost else ()
+
+    def update_data(self) -> None:
+        # One extra line per hint; only touch styles when it changes (relayout).
+        height = 2 + len(self.notes)
+        if getattr(self, "_height", None) != height:
+            self._height = height
+            self.styles.height = height
+        self.refresh()
 
     def render_text(self) -> Text:
         th = self.gputop_theme
@@ -348,18 +392,27 @@ class GpuInfoBar(LinesWidget):
             if tags:
                 second += [("throttle ", label),
                            (" ".join(tags), th.grad("util", 1.0) if warn else th.style("inactive_fg"))]
-            else:
+            elif s.throttle_reasons is not None:
                 second += [("throttle ", label), ("none", dim)]
+            for name, v in (s.engine_util or {}).items():
+                if second:
+                    second.append(("  ", dim))
+                second += [(name + " ", label), (fmt.pct(v), th.grad("util", v / 100))]
             if s.enc_util is not None or s.dec_util is not None:
                 second += [sep, ("enc ", label), (fmt.pct(s.enc_util), value),
                            ("  dec ", label), (fmt.pct(s.dec_util), value)]
             nprocs = len(st.processes)
-            second += [sep, (f"{nprocs} process{'es' if nprocs != 1 else ''}", value)]
+            if second:
+                second.append(sep)
+            second += [(f"{nprocs} process{'es' if nprocs != 1 else ''}", value)]
             if st.error:
                 second += [sep, (st.error, th.style("hi_fg"))]
 
+        rows = [first, second]
+        for note in self.notes:
+            rows.append([("⚠ ", th.style("hi_fg")), (note, th.style("inactive_fg"))])
         lines = []
-        for parts in (first, second):
+        for parts in rows:
             line = Text(no_wrap=True)
             for t, style in parts:
                 line.append(t, style)
@@ -452,18 +505,48 @@ class GpuDetail(Container):
             sub = T((f"Gen{s.pcie_gen} x{s.pcie_width}", "graph_text")) if s.pcie_gen else None
             return t, sub
 
+        # A box stays hidden while its metric has no data at all, so GPUs that
+        # can't report something (VRAM on Intel iGPUs, power without RAPL
+        # access, PCIe without a link...) don't show empty boxes.
+        temp_vmax = lambda: max(100.0, st.history["temp_core"].max() or 0)  # noqa: E731
+        boxes = [
+            MetricBox(util_title, self._hist("util_gpu", lambda: 100.0), th, "util", metrics=("util_gpu",)),
+            MetricBox(vram_title, self._hist("mem_percent", lambda: 100.0), th, "vram", metrics=("mem_percent",)),
+            MetricBox(power_title, self._hist("power_draw", power_vmax), th, "power", metrics=("power_draw",)),
+            MetricBox(temp_title, self._hist("temp_core", temp_vmax), th, "temp", metrics=("temp_core",)),
+            MetricBox(clock_title, self._hist("clock_graphics", clock_vmax), th, "util",
+                      metrics=("clock_graphics",)),
+            MetricBox(pcie_title, self._hist("pcie_rx", pcie_vmax), th, "rx",
+                      mirror_source=self._hist("pcie_tx", pcie_vmax), mirror_gradient="tx",
+                      metrics=("pcie_rx", "pcie_tx")),
+        ]
+        self._cols = 3
+        self._visible: tuple[bool, ...] | None = None
         with Container(id="graphs"):
-            yield MetricBox(util_title, self._hist("util_gpu", lambda: 100.0), th, "util")
-            yield MetricBox(vram_title, self._hist("mem_percent", lambda: 100.0), th, "vram")
-            yield MetricBox(power_title, self._hist("power_draw", power_vmax), th, "power")
-            yield MetricBox(temp_title, self._hist("temp_core", lambda: max(100.0, st.history["temp_core"].max() or 0)), th, "temp")
-            yield MetricBox(clock_title, self._hist("clock_graphics", clock_vmax), th, "util")
-            yield MetricBox(pcie_title, self._hist("pcie_rx", pcie_vmax), th, "rx",
-                            mirror_source=self._hist("pcie_tx", pcie_vmax), mirror_gradient="tx")
+            yield from boxes
+
+    def on_mount(self) -> None:
+        self._sync_boxes()
+
+    def _sync_boxes(self) -> None:
+        boxes = list(self.query(MetricBox))
+        visible = tuple(
+            any(v is not None for m in b.metrics for v in self.state.history[m].tail(512)) for b in boxes
+        )
+        if not any(visible):
+            visible = tuple(True for _ in boxes)  # nothing yet: keep the grid shape
+        if visible != self._visible:
+            self._visible = visible
+            for box, show in zip(boxes, visible):
+                box.display = show
+            self.set_columns(self._cols)
 
     def set_columns(self, cols: int) -> None:
+        self._cols = cols
         graphs = self.query_one("#graphs")
-        rows = (6 + cols - 1) // cols
+        n = sum(self._visible) if self._visible else 6
+        cols = max(1, min(cols, n))
+        rows = (n + cols - 1) // cols
         graphs.styles.grid_size_columns = cols
         graphs.styles.grid_size_rows = rows
 
@@ -476,7 +559,8 @@ class GpuDetail(Container):
             w.refresh()
 
     def update_data(self) -> None:
+        self._sync_boxes()
         for w in self.query(MetricBox):
             w.update_data()
         for w in self.query(GpuInfoBar):
-            w.refresh()
+            w.update_data()
