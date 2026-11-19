@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gputop"
+version = "0.1.0"
+description = "A btop-style multi-GPU terminal monitor for Linux"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+keywords = ["gpu", "nvidia", "monitor", "nvml", "tui", "btop"]
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Monitoring",
+]
+dependencies = [
+    "nvidia-ml-py>=12.535",
+    "psutil>=5.9",
+    "textual>=0.80",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+gputop = "gputop.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "tests"]
