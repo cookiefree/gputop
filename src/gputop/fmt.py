@@ -13,7 +13,12 @@ def short_gpu_name(name: str) -> str:
     """'NVIDIA GeForce RTX 4090' -> 'RTX 4090'."""
     for prefix in ("NVIDIA GeForce ", "NVIDIA ", "GeForce ", "AMD Radeon ", "Intel(R) ", "Intel "):
         if name.startswith(prefix):
-            return name[len(prefix):]
+            name = name[len(prefix):]
+            break
+    # pci.ids names often end in a generic word that only costs title space.
+    for suffix in (" Graphics Controller", " Controller"):
+        if name.endswith(suffix) and len(name) > len(suffix) + 3:
+            return name[: -len(suffix)] + (" Graphics" if suffix == " Graphics Controller" else "")
     return name
 
 
@@ -88,3 +93,29 @@ def truncate(s: str, width: int) -> str:
     if width == 1:
         return "…"
     return s[: width - 1] + "…"
+
+
+def mem_compact(used: int | None, total: int | None) -> str:
+    """'22.7/24.0G' (btop-like compact pair, unit of the total)."""
+    if used is None:
+        return "-"
+    gib, mib = 1024**3, 1024**2
+    if total and total >= gib:
+        return f"{used / gib:.1f}/{total / gib:.1f}G"
+    if total:
+        return f"{used / mib:.0f}/{total / mib:.0f}M"
+    return bytes_short(used)
+
+
+def gib(n: int | None) -> str:
+    """'24.0 GiB' / '512 MiB' (btop mem box style)."""
+    if n is None:
+        return "-"
+    if n >= 1024**3:
+        return f"{n / 1024**3:.1f} GiB"
+    return f"{n / 1024**2:.0f} MiB"
+
+
+def rate_compact(n: float | None) -> str:
+    """'2.5GB/s' (no space; PCIe stats row)."""
+    return rate(n).replace(" ", "")

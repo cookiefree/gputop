@@ -53,33 +53,36 @@ def text_to_segments(text: Text, default: Style | None = None) -> list[Segment]:
     """Convert a single-line Rich Text into segments without a Console.
 
     Much cheaper than letting Textual convert ``Text`` -> ``Content`` -> strips
-    on every refresh, which dominated CPU use in profiling. Overlapping spans
-    are combined in order, like Rich does.
+    on every refresh. Linear in the line length: spans are painted onto a
+    per-cell style array (later spans combine on top, like Rich), then runs of
+    equal style are merged.
     """
     plain = text.plain
-    if not plain:
+    n = len(plain)
+    if not n:
         return []
     base = text.style if isinstance(text.style, Style) and text.style else default
     spans = text.spans
     if not spans:
         return [Segment(plain, base)]
-    bounds = {0, len(plain)}
+    styles: list[Style | None] = [base] * n
     for sp in spans:
-        bounds.add(max(0, min(len(plain), sp.start)))
-        bounds.add(max(0, min(len(plain), sp.end)))
-    edges = sorted(bounds)
-    segments: list[Segment] = []
-    for start, end in zip(edges, edges[1:]):
-        if start == end:
+        st = sp.style
+        if not isinstance(st, Style):
             continue
-        style = base
-        for sp in spans:
-            if sp.start <= start and sp.end >= end and isinstance(sp.style, Style):
-                style = sp.style if style is None else style + sp.style
-        if segments and segments[-1].style == style:
-            segments[-1] = Segment(segments[-1].text + plain[start:end], style)
-        else:
-            segments.append(Segment(plain[start:end], style))
+        a, b = max(0, sp.start), min(n, sp.end)
+        for i in range(a, b):
+            cur = styles[i]
+            styles[i] = st if cur is None or cur is base else cur + st
+    segments: list[Segment] = []
+    run_start = 0
+    run_style = styles[0]
+    for i in range(1, n):
+        st = styles[i]
+        if st is not run_style and st != run_style:
+            segments.append(Segment(plain[run_start:i], run_style))
+            run_start, run_style = i, st
+    segments.append(Segment(plain[run_start:], run_style))
     return segments
 
 
@@ -101,15 +104,16 @@ class LinesWidget(Widget):
         self._strips = None
         return super().refresh(*args, **kwargs)
 
+    def render_line_texts(self) -> list[Text]:
+        """One Text per row. Override to skip the join/split round trip."""
+        return self.render_text().split("\n", allow_blank=True)
+
     def _build_strips(self) -> list[Strip]:
         w = self.content_size.width
         theme = self.gputop_theme  # type: ignore[attr-defined]
         base = theme.base_style
-        text = self.render_text()
-        strips = []
-        for line in text.split("\n", allow_blank=True):
-            strips.append(Strip(text_to_segments(line, base)).crop_extend(0, w, base))
-        return strips
+        return [Strip(text_to_segments(line, base)).crop_extend(0, w, base)
+                for line in self.render_line_texts()]
 
     def render_line(self, y: int) -> Strip:
         if self._strips is None:

@@ -1,26 +1,49 @@
-"""Per-GPU widgets: the compact boxed panel (overview) and the detail view."""
+"""GPU boxes drawn like btop's cpu / mem / net boxes.
+
+Overview box (one per GPU, btop's cpu box)::
+
+    ╭─┐¹gpu0┌┐RTX 4090┌──┐help┌────────┐13:18:07┌──────────┐- 500ms +┌─╮
+    │ util                                ╭────────────────────────────────────╮ │
+    │ ⣀⣀⣀⣠⣴⣶⣷⣿⣿⣿⣿⣿⣿⣿⣶⣦⣄⣀              │vram  ■■■■■■■■■■■■■■■■■■■■ 22.7/24.0G│ │
+    │ power                               │util  ■■■■■■■■■■■■■■■■■■■■       93%│ │
+    │ ⣀⣀⣀⣠⣤⣶⣿⣿⣿⣿⣿⣿⣿⣶⣤⣀⣀                │...                                 │ │
+    ╰┘nvidia 555.42.02└──────────────────────────────────────┘PWR└┘7 procs└╯
+
+Left: braille area graphs (util ~60 %, power ~40 %) with a graph_text label in
+the top-left corner. Right: a fixed 38-column stats panel in a div_line inner
+box (a plain divider line when there is no room for the box).
+"""
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Sequence
+
 
 from rich.style import Style
 from rich.text import Text
 from textual.app import ComposeResult
-from textual.containers import Container
+from textual.containers import Container, Horizontal
 from textual.events import Click
+from textual.geometry import Region
 from textual.message import Message
+from textual.strip import Strip
 from textual.widget import Widget
 
 from .. import fmt
 from ..backends.base import THROTTLE_LABELS, THROTTLE_WARNING, GPUSample
 from ..sampler import DeviceState
 from ..themes import Theme
-from .braille_graph import BrailleGraph, graph_text
-from .common import LinesWidget, join_lines, reset_titles, set_border, set_title
-from .meter import meter_text
+from .box import V, BoxStyle, Tab, box_bottom, box_lines, box_top, hotkey_tab, interval_tab
+from .braille_graph import graph_text
+from .common import LinesWidget, join_lines, text_to_segments
 
+STATS_W = 38  # stats panel content width
 LABEL_W = 6
+VALUE_W = 10
+MIN_GRAPH_W = 12
+
+_EMPTY = GPUSample(index=-1)
 
 
 def throttle_tags(sample: GPUSample | None) -> tuple[list[str], bool]:
@@ -34,48 +57,102 @@ def throttle_tags(sample: GPUSample | None) -> tuple[list[str], bool]:
     return [THROTTLE_LABELS.get(r, r.upper()) for r in reasons], False
 
 
-def gpu_title(state: DeviceState, theme: Theme, hotkey: int | None, focused: bool) -> Text:
-    t = Text()
-    if hotkey is not None and hotkey <= 9:
-        t.append(fmt.superscript(hotkey), theme.style("hi_fg"))
-    t.append(f"GPU {state.index}", theme.style("title", bold=True))
-    t.append(" · ", theme.style("graph_text"))
-    t.append(fmt.short_gpu_name(state.info.name), theme.style("hi_fg" if focused else "title"))
-    return t
+def overlay(row: Text, x: int, label: Text) -> Text:
+    """``row`` with ``label`` written over it starting at cell ``x``."""
+    if x >= row.cell_len or label.cell_len == 0:
+        return row
+    end = min(row.cell_len, x + label.cell_len)
+    out = row[:x]
+    lab = label.copy()
+    lab.truncate(end - x, overflow="crop")
+    out.append_text(lab)
+    out.append_text(row[end:])
+    return out
 
 
-def status_subtitle(state: DeviceState, theme: Theme) -> Text | None:
-    if state.lost:
-        return Text("LOST", theme.style("hi_fg", bold=True))
-    if state.error:
-        return Text("error", theme.style("hi_fg"))
-    tags, warn = throttle_tags(state.latest)
-    if not tags:
-        return None
-    if warn:
-        return Text("⚠ " + " ".join(tags), theme.grad("util", 1.0))
-    return Text(" ".join(tags).lower(), theme.style("inactive_fg"))
+def wrap_words(text: str, width: int) -> list[str]:
+    words, lines, cur = text.split(), [], ""
+    for w in words:
+        if cur and len(cur) + 1 + len(w) > width:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = f"{cur} {w}" if cur else w
+    if cur:
+        lines.append(cur)
+    return [fmt.truncate(line, width) for line in lines]
 
 
-class GpuPanel(LinesWidget):
-    """A btop-style boxed summary of one GPU, sized to whatever space it gets.
+# -- base box widget -------------------------------------------------------------
 
-    Rows by priority (the first ones always fit; the rest appear as the panel
-    grows, and any leftover height makes the graphs taller):
-    util graph, VRAM meter, status (temp/fan/clock), power graph,
-    PCIe, memory-controller + codec, clocks.
-    """
 
-    DEFAULT_CSS = """
-    GpuPanel {
-        border: round white;
-        border-title-align: left;
-        border-subtitle-align: right;
-        padding: 0 1;
-        height: 6;
-        width: 1fr;
-    }
-    """
+class BoxWidget(LinesWidget):
+    """A widget that draws its own btop box chrome around its content."""
+
+    color_key = "cpu_box"
+    pad = 1
+
+    def __init__(self, theme: Theme, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.gputop_theme = theme
+
+    # Subclasses override these three.
+    def top_tabs(self) -> tuple[list[Tab], Tab | None, list[Tab]]:
+        return [], None, []
+
+    def bottom_tabs(self) -> tuple[list[Tab], list[Tab]]:
+        return [], []
+
+    def content(self, w: int, h: int) -> list[Text]:
+        return []
+
+    @property
+    def inner_size(self) -> tuple[int, int]:
+        w, h = self.size
+        return max(0, w - 2 - 2 * self.pad), max(0, h - 2)
+
+    def _top(self) -> Text:
+        left, center, right = self.top_tabs()
+        return box_top(self.size.width, self.gputop_theme, self.color_key, left, center, right)
+
+    def render_line_texts(self) -> list[Text]:
+        w, h = self.size
+        th = self.gputop_theme
+        if w <= 0 or h <= 0:
+            return []
+        cw, ch = self.inner_size
+        bl, br = self.bottom_tabs()
+        return box_lines(w, h, th, self.color_key, self.content(cw, ch) if cw and ch else [],
+                         top=self._top(), bottom=box_bottom(w, th, self.color_key, bl, br), pad=self.pad)
+
+    def render_text(self) -> Text:
+        return join_lines(self.render_line_texts(), self.size.width)
+
+    def refresh_top(self) -> None:
+        """Repaint only the top border (for the ticking clock)."""
+        if self._strips is None or not self._strips:
+            self.refresh()
+            return
+        w = self.size.width
+        base = self.gputop_theme.base_style
+        self._strips[0] = Strip(text_to_segments(self._top(), base)).crop_extend(0, w, base)
+        Widget.refresh(self, Region(0, 0, w, 1))
+
+    def apply_theme(self, theme: Theme) -> None:
+        self.gputop_theme = theme
+        self.refresh()
+
+    def update_data(self) -> None:
+        self.refresh()
+
+
+# -- GPU box -----------------------------------------------------------------------
+
+
+class GpuPanel(BoxWidget):
+    """One GPU (btop's cpu box): graphs on the left, stats panel on the right."""
+
+    color_key = "cpu_box"
 
     class Selected(Message):
         def __init__(self, index: int, chain: int) -> None:
@@ -83,484 +160,417 @@ class GpuPanel(LinesWidget):
             self.index = index
             self.chain = chain
 
-    def __init__(self, state: DeviceState, theme: Theme, hotkey: int | None = None, **kwargs) -> None:
-        super().__init__(**kwargs)
+    def __init__(self, state: DeviceState, theme: Theme, hotkey: int | None = None, detail: bool = False,
+                 **kwargs) -> None:
+        super().__init__(theme, **kwargs)
         self.state = state
-        self.gputop_theme = theme
         self.hotkey = hotkey
         self.selected = False
-
-    # -- styling --------------------------------------------------------------
-
-    def apply_theme(self, theme: Theme) -> None:
-        self.gputop_theme = theme
-        reset_titles(self)
-        self.update_chrome()
-        self.refresh()
+        self.detail = detail
+        self.show_clock = False
+        self.interval_ms: Callable[[], int] = lambda: 0
 
     def set_selected(self, selected: bool) -> None:
         if selected != self.selected:
             self.selected = selected
-            self.update_chrome()
-
-    def update_chrome(self) -> None:
-        th = self.gputop_theme
-        if self.state.lost:
-            color = th["inactive_fg"]
-        elif self.selected:
-            color = th["hi_fg"]
-        else:
-            color = th["cpu_box"]
-        set_border(self, color)
-        set_title(self, "border_title", gpu_title(self.state, th, self.hotkey, self.selected))
-        set_title(self, "border_subtitle", status_subtitle(self.state, th))
-
-    def on_mount(self) -> None:
-        self.update_chrome()
-
-    def update_data(self) -> None:
-        self.update_chrome()
-        self.refresh()
+            self.refresh()
 
     def on_click(self, event: Click) -> None:
         event.stop()
         self.post_message(self.Selected(self.state.index, getattr(event, "chain", 1)))
 
-    # -- rendering ------------------------------------------------------------
+    # -- chrome ---------------------------------------------------------------
 
-    def _plan_rows(self, s: GPUSample, h: int) -> tuple[list[str], int, int]:
-        has_util = s.util_gpu is not None
-        available = {
-            "util": has_util,
-            # When utilisation is unavailable, a one-line hint explains why.
-            "hint": not has_util and bool(s.notes),
-            # No VRAM row for GPUs without dedicated memory (Intel iGPUs).
-            "vram": s.mem_total is not None,
-            "status": True,
-            "power": s.power_draw is not None,
-            "pcie": s.pcie_rx is not None or s.pcie_tx is not None,
-            "mctl": s.util_mem is not None or s.enc_util is not None or s.dec_util is not None
-            or bool(s.engine_util),
-            "clocks": s.clock_graphics is not None or s.clock_mem is not None,
-        }
-        priority = ["util", "hint", "vram", "status", "power", "pcie", "mctl", "clocks"]
-        chosen = [r for r in priority if available[r]][: max(1, h)]
-        order = ["util", "hint", "vram", "power", "status", "mctl", "pcie", "clocks"]
-        rows = [r for r in order if r in chosen]
-        extra = max(0, h - len(rows))
-        if "util" in rows and "power" in rows:
-            util_h = 1 + extra - extra // 2
-            power_h = 1 + extra // 2
-        elif "util" in rows:
-            util_h, power_h = 1 + extra, 1
-        else:
-            util_h, power_h = 1, 1 + extra
-        return rows, util_h, power_h
-
-    def max_content_rows(self) -> int | None:
-        """Rows this panel can use, or None if it can grow (has graphs)."""
-        s = self.state.latest
-        if s is None or self.state.lost:
-            return None
-        rows, _, _ = self._plan_rows(s, 99)
-        if "util" in rows or "power" in rows:
-            return None
-        return len(rows)
-
-    def render_text(self) -> Text:
-        w, h = self.content_size
-        th = self.gputop_theme
+    def top_tabs(self):
         st = self.state
-        if w <= 0 or h <= 0:
-            return Text("")
+        sup = fmt.superscript(self.hotkey) if self.hotkey is not None and self.hotkey <= 9 else ""
+        left = [Tab(f"gpu{st.index}", prefix=sup, selected=self.selected),
+                Tab(fmt.short_gpu_name(st.info.name))]
+        center = right = None
+        if self.show_clock:
+            left.append(hotkey_tab("help", gap=2))
+            center = Tab(time.strftime("%H:%M:%S"))
+            right = [interval_tab(self.interval_ms())]
+        return left, center, right or []
+
+    def bottom_tabs(self):
+        st, info = self.state, self.state.info
+        drv = info.driver_version or ""
+        if drv[:1].isdigit() and info.vendor:
+            drv = f"{info.vendor.lower()} {drv}"
+        left = [Tab(drv, key="graph_text", bold=False)] if drv else []
+        right: list[Tab] = []
         if st.lost:
-            msg = Text("GPU no longer available", th.style("hi_fg", bold=True), justify="center")
-            pad = Text("\n" * max(0, (h - 1) // 2))
-            return pad + msg
+            right.append(Tab("LOST", key="hi_fg"))
+        elif st.error:
+            right.append(Tab("error", key="hi_fg"))
+        else:
+            tags, warn = throttle_tags(st.latest)
+            if warn:
+                right += [Tab(t, key="hi_fg") for t in tags]
+            elif tags:
+                right.append(Tab(" ".join(tags).lower(), key="inactive_fg", bold=False))
+            n = len(st.processes)
+            right.append(Tab(f"{n} proc{'s' if n != 1 else ''}", bold=False))
+        return left, right
+
+    # -- content --------------------------------------------------------------
+
+    def content(self, w: int, h: int) -> list[Text]:
+        th, st = self.gputop_theme, self.state
+        if st.lost:
+            msg = Text("GPU no longer available", th.style("hi_fg", bold=True))
+            return [Text("")] * max(0, (h - 1) // 2) + [msg]
         s = st.latest
         if s is None:
-            return Text("waiting for data…", th.style("inactive_fg"))
+            return [Text("waiting for data…", th.style("inactive_fg"))]
 
-        label = th.style("main_fg")
-        value = th.style("title")
-        dim = th.style("graph_text")
+        rows = stats_rows(st, th, STATS_W)
+        if w < STATS_W + 2 + MIN_GRAPH_W:
+            # Too narrow for graphs: stats only, as wide as the box allows.
+            return [r for _, r in stats_rows(st, th, w)][:h]
 
-        util_v = fmt.pct(s.util_gpu)
-        vram_v = fmt.mem_pair(s.mem_used, s.mem_total)
-        pwr_v = fmt.power_pair(s.power_draw, s.power_limit)
-        vw = max(
-            len(util_v) if s.util_gpu is not None else 0,
-            len(vram_v) if s.mem_total is not None else 0,
-            len(pwr_v) if s.power_draw is not None else 0,
-            4,
-        )
-        bar_w = max(1, w - LABEL_W - 1 - vw)
+        boxed = h >= len(rows) + 2
+        panel_w = STATS_W + 2 if boxed else STATS_W + 1
+        gw = w - panel_w - 1
+        graph = graph_area(st, th, gw, h, util_only=self.detail)
+        panel = stats_panel(rows, th, h, boxed)
+        sep = Text(" ", th.base_style)
+        return [g + sep + p for g, p in zip(graph, panel)]
 
-        rows, util_h, power_h = self._plan_rows(s, h)
-        lines: list[Text] = []
 
-        def graph_rows(name: str, values, gh: int, vmax: float, grad: str, val: str) -> None:
-            g = graph_text(values, bar_w, gh, th.gradient(grad), 0.0, vmax)
-            for i, row in enumerate(g):
-                line = Text(no_wrap=True, overflow="crop")
-                line.append((name if i == 0 else "").ljust(LABEL_W), label)
-                line.append_text(row)
-                line.append(" " + (val.rjust(vw) if i == 0 else " " * vw), value)
-                lines.append(line)
+def stats_rows(st: DeviceState, th: Theme, width: int) -> list[tuple[str, Text]]:
+    """The right-hand stats rows, in display order, each ``width`` cells."""
+    s = st.latest or _EMPTY
+    info = st.info
+    label, value, dim = th.style("main_fg"), th.style("title"), th.style("graph_text")
+    meter_w = max(1, width - LABEL_W - 1 - VALUE_W)
+    out: list[tuple[str, Text]] = []
 
-        for r in rows:
-            if r == "util":
-                graph_rows("util", st.history["util_gpu"].tail(bar_w * 2), util_h, 100.0, "util", util_v)
-            elif r == "hint":
-                line = Text(no_wrap=True)
-                line.append("⚠ ", th.style("hi_fg"))
-                line.append(fmt.truncate(s.notes[0], w - 2), th.style("inactive_fg"))
-                lines.append(line)
-            elif r == "vram":
-                line = Text(no_wrap=True, overflow="crop")
-                line.append("vram".ljust(LABEL_W), label)
-                frac = None if s.mem_percent is None else s.mem_percent / 100
-                line.append_text(meter_text(frac, bar_w, th, "vram"))
-                line.append(" " + vram_v.rjust(vw), value)
-                lines.append(line)
-            elif r == "power":
-                vmax = s.power_limit or st.info.power_limit_max or st.history["power_draw"].max() or 1.0
-                graph_rows("power", st.history["power_draw"].tail(bar_w * 2), power_h, vmax, "power", pwr_v)
-            elif r == "status":
-                lines.append(self._status_line(s, w, label, value, dim))
-            elif r == "mctl":
-                parts = []
-                if s.util_mem is not None:
-                    parts.append(("mctl ", s.util_mem))
-                if s.enc_util is not None:
-                    parts.append(("enc ", s.enc_util))
-                if s.dec_util is not None:
-                    parts.append(("dec ", s.dec_util))
-                for name, v in (s.engine_util or {}).items():
-                    parts.append((name + " ", v))
-                line = Text(no_wrap=True, overflow="crop")
-                for i, (name, v) in enumerate(parts):
-                    if i:
-                        line.append("  ")
-                    line.append(name, label)
-                    line.append(fmt.pct(v), th.grad("util", v / 100))
-                lines.append(line)
-            elif r == "pcie":
-                line = Text(no_wrap=True, overflow="crop")
-                line.append("pcie".ljust(LABEL_W), label)
-                line.append("↓", th.grad("rx", 1.0))
-                line.append(fmt.rate(s.pcie_rx), value)
-                line.append("  ↑", th.grad("tx", 1.0))
-                line.append(fmt.rate(s.pcie_tx), value)
-                if s.pcie_gen is not None and s.pcie_width is not None:
-                    link = f"  Gen{s.pcie_gen}x{s.pcie_width}"
-                    if line.cell_len + len(link) <= w:
-                        line.append(link, dim)
-                lines.append(line)
-            elif r == "clocks":
-                line = Text(no_wrap=True, overflow="crop")
-                line.append("clk".ljust(LABEL_W), label)
-                gmax = st.info.clock_graphics_max
-                if s.clock_graphics is not None:
-                    line.append(f"{s.clock_graphics}", value)
-                    if gmax:
-                        line.append(f"/{gmax}", dim)
-                    line.append(" MHz", dim)
-                if s.clock_mem is not None:
-                    line.append("  mem ", label)
-                    line.append(f"{s.clock_mem}", value)
-                    line.append(" MHz", dim)
-                lines.append(line)
-        return join_lines(lines[:h], w)
+    def meter_row(name: str, frac: float | None, grad: str, val: str, val_style: Style) -> Text:
+        t = Text(no_wrap=True)
+        t.append(name.ljust(LABEL_W), label)
+        if frac is not None:
+            t.append_text(btop_meter(frac, meter_w, th, grad))
+        else:
+            t.append(" " * meter_w, th.base_style)
+        t.append(" " + val.rjust(VALUE_W), val_style)
+        return t
 
-    def _status_line(self, s: GPUSample, w: int, label: Style, value: Style, dim: Style) -> Text:
-        th = self.gputop_theme
-        segments: list[list[tuple[str, Style]]] = []
-        if s.temp_core is not None:
-            segments.append([("temp ", label), (fmt.temp(s.temp_core), th.grad("temp", s.temp_core / 100))])
-        if s.temp_mem is not None:
-            segments.append([("mem ", label), (fmt.temp(s.temp_mem), th.grad("temp", s.temp_mem / 100))])
-        if s.fan is not None:
-            segments.append([("fan ", label), (fmt.pct(s.fan), th.grad("temp", s.fan / 100))])
+    def pairs(items: Sequence[tuple[str, str, Style]]) -> Text:
+        t = Text(no_wrap=True)
+        for i, (name, val, style) in enumerate(items):
+            if i:
+                t.append("  ", th.base_style)
+            t.append(name, label)
+            t.append(val, style)
+        return t
+
+    if s.mem_total is not None:
+        frac = None if s.mem_percent is None else s.mem_percent / 100
+        out.append(("vram", meter_row("vram", frac, "vram", fmt.mem_compact(s.mem_used, s.mem_total), value)))
+    if s.util_gpu is not None:
+        out.append(("util", meter_row("util", s.util_gpu / 100, "util", fmt.pct(s.util_gpu),
+                                      th.grad("util", s.util_gpu / 100))))
+    if s.power_draw is not None:
+        limit = s.power_limit or info.power_limit_max
+        frac = s.power_draw / limit if limit else None
+        out.append(("power", meter_row("power", frac, "power", fmt.power_pair(s.power_draw, s.power_limit),
+                                       value)))
+    temps: list[tuple[str, str, Style]] = []
+    if s.temp_core is not None:
+        temps.append(("temp ", fmt.temp(s.temp_core), th.temp(s.temp_core)))
+    if s.temp_mem is not None:
+        temps.append(("mem ", fmt.temp(s.temp_mem), th.temp(s.temp_mem)))
+    if s.fan is not None:
+        temps.append(("fan ", fmt.pct(s.fan), th.grad("temp", s.fan / 100)))
+    if temps:
+        out.append(("temp", pairs(temps)))
+    if s.clock_graphics is not None or s.clock_mem is not None:
+        items = []
         if s.clock_graphics is not None:
-            segments.append([(f"{s.clock_graphics}", value), ("MHz", dim)])
-        line = Text(no_wrap=True, overflow="crop")
-        used = 0
-        for seg in segments:
-            seg_len = sum(len(t) for t, _ in seg) + (2 if used else 0)
-            if used + seg_len > w:
-                # Drop memory temperature first when space is tight.
-                continue
-            if used:
-                line.append("  ")
-            for t, st in seg:
-                line.append(t, st)
-            used += seg_len
-        return line
+            items.append(("clk  ", f"{s.clock_graphics} MHz", value))
+        if s.clock_mem is not None:
+            items.append(("mem ", f"{s.clock_mem} MHz", value))
+        out.append(("clk", pairs(items)))
+    codec: list[tuple[str, str, Style]] = []
+    if s.util_mem is not None:
+        codec.append(("mctl ", fmt.pct(s.util_mem), th.grad("util", s.util_mem / 100)))
+    if s.enc_util is not None:
+        codec.append(("enc ", fmt.pct(s.enc_util), th.grad("util", s.enc_util / 100)))
+    if s.dec_util is not None:
+        codec.append(("dec ", fmt.pct(s.dec_util), th.grad("util", s.dec_util / 100)))
+    for name, v in (s.engine_util or {}).items():
+        codec.append((name + " ", fmt.pct(v), th.grad("util", v / 100)))
+    if s.pcie_rx is not None or s.pcie_tx is not None:
+        t = Text(no_wrap=True)
+        t.append("pcie".ljust(LABEL_W), label)
+        t.append("▼", label)
+        t.append(fmt.rate_compact(s.pcie_rx), value)
+        t.append("  ▲", label)
+        t.append(fmt.rate_compact(s.pcie_tx), value)
+        if s.pcie_gen is not None and s.pcie_width is not None:
+            link = f"  Gen{s.pcie_gen}x{s.pcie_width}"
+            if t.cell_len + len(link) <= width:
+                t.append(link, dim)
+        out.append(("pcie", t))
+    if codec:
+        out.append(("mctl", pairs(codec)))
+    return [(name, _fit(t, width, th)) for name, t in out]
 
 
-class MetricBox(BrailleGraph):
-    """A boxed, titled history graph used by the detail view."""
-
-    DEFAULT_CSS = """
-    MetricBox {
-        border: round white;
-        border-title-align: left;
-        border-subtitle-align: right;
-        height: 1fr;
-        width: 1fr;
-    }
-    """
-
-    def __init__(self, title_fn: Callable[[], tuple[Text, Text | None]], *args, metrics: tuple[str, ...] = (),
-                 **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self.title_fn = title_fn
-        self.metrics = metrics  # history keys; the box hides while all are empty
-
-    def apply_theme(self, theme: Theme) -> None:
-        self.gputop_theme = theme
-        reset_titles(self)
-        self.update_chrome()
-        self.refresh()
-
-    def update_chrome(self) -> None:
-        set_border(self, self.gputop_theme["cpu_box"])
-        title, subtitle = self.title_fn()
-        set_title(self, "border_title", title)
-        set_title(self, "border_subtitle", subtitle)
-
-    def on_mount(self) -> None:
-        self.update_chrome()
-
-    def update_data(self) -> None:
-        self.update_chrome()
-        self.refresh()
+def _fit(t: Text, width: int, th: Theme) -> Text:
+    if t.cell_len > width:
+        t = t.copy()
+        t.truncate(width, overflow="crop")
+    elif t.cell_len < width:
+        t = t.copy()
+        t.append(" " * (width - t.cell_len), th.base_style)
+    return t
 
 
-class GpuInfoBar(LinesWidget):
-    """Static facts + headline numbers at the top of the detail view."""
+def btop_meter(frac: float, width: int, th: Theme, gradient: str) -> Text:
+    """btop meter: ``■`` cells, each filled one coloured by its position along
+    the bar (green at the left end, red at the right end), the rest meter_bg."""
+    filled = int(round(max(0.0, min(1.0, frac)) * width))
+    steps = th.gradient(gradient)
+    last = len(steps) - 1
+    denom = max(1, width - 1)
+    t = Text(no_wrap=True)
+    for i in range(filled):
+        t.append("■", steps[int(round(i / denom * last))])
+    if filled < width:
+        t.append("■" * (width - filled), th.style("meter_bg"))
+    return t
 
-    DEFAULT_CSS = "GpuInfoBar { height: 2; padding: 0 1; }"
+
+def stats_panel(rows: list[tuple[str, Text]], th: Theme, h: int, boxed: bool) -> list[Text]:
+    """The stats rows framed by a div_line inner box (vertically centred), or
+    behind a single div_line divider when there is no room for the box."""
+    div = th.style("div_line")
+    blank = Text(" " * STATS_W, th.base_style)
+    if not boxed:
+        lines = []
+        for i in range(h):
+            t = Text(V, div)
+            t.append_text(rows[i][1] if i < len(rows) else blank)
+            lines.append(t)
+        return lines
+    tl, tr, bl, br = BoxStyle.corners()
+    box = [Text(tl + "─" * STATS_W + tr, div)]
+    for _, r in rows:
+        t = Text(V, div)
+        t.append_text(r)
+        t.append(V, div)
+        box.append(t)
+    box.append(Text(bl + "─" * STATS_W + br, div))
+    top = (h - len(box)) // 2
+    empty = Text(" " * (STATS_W + 2), th.base_style)
+    return [empty] * top + box + [empty] * (h - top - len(box))
+
+
+def labelled_graph(values, w: int, h: int, th: Theme, grad: str, vmax: float, label: Text | None,
+                   invert: bool = False) -> list[Text]:
+    rows = graph_text(values, w, h, th.gradient(grad), 0.0, max(vmax, 1e-9), invert=invert)
+    rows = [_fit(r, w, th) for r in rows]
+    if label is not None and rows:
+        idx = len(rows) - 1 if invert else 0
+        rows[idx] = overlay(rows[idx], 0, label)
+    return rows
+
+
+def graph_area(st: DeviceState, th: Theme, w: int, h: int, util_only: bool = False) -> list[Text]:
+    """util (top ~60 %) and power (bottom ~40 %) braille area graphs."""
+    s = st.latest or _EMPTY
+    info = st.info
+    gt = th.style("graph_text")
+    hist = st.history
+    has_power = s.power_draw is not None and not util_only and h >= 2
+    has_util = s.util_gpu is not None
+    uh = h if not has_power else max(1, round(h * 0.6))
+    ph = h - uh
+    out: list[Text] = []
+    if has_util:
+        out += labelled_graph(hist["util_gpu"].tail(w * 2), w, uh, th, "util", 100.0, Text("util", gt))
+    else:
+        # No utilisation (e.g. Intel without perf access): explain why, and show
+        # the clock history instead, which still reflects GPU activity.
+        hint = [Text(line, th.style("inactive_fg")) for line in wrap_words(s.notes[0], w)] if s.notes else []
+        hint = hint[: max(0, uh - 1)] if s.clock_graphics is not None else hint[:uh]
+        gh = uh - len(hint)
+        if gh > 0 and s.clock_graphics is not None:
+            vmax = float(info.clock_graphics_max or hist["clock_graphics"].max() or 1)
+            out += [_fit(t, w, th) for t in hint]
+            out += labelled_graph(hist["clock_graphics"].tail(w * 2), w, gh, th, "util", vmax, Text("clk", gt))
+        else:
+            out += [_fit(t, w, th) for t in hint] + [Text(" " * w, th.base_style)] * (uh - len(hint))
+    if ph > 0:
+        vmax = s.power_limit or info.power_limit_max or hist["power_draw"].max() or 1.0
+        out += labelled_graph(hist["power_draw"].tail(w * 2), w, ph, th, "power", vmax, Text("power", gt))
+    return out[:h]
+
+
+# -- detail view boxes ----------------------------------------------------------------
+
+
+class DetailBox(BoxWidget):
+    """Base for the detail-view boxes; hidden while it has nothing to show."""
+
+    metrics: tuple[str, ...] = ()
 
     def __init__(self, state: DeviceState, theme: Theme, **kwargs) -> None:
-        super().__init__(**kwargs)
+        super().__init__(theme, **kwargs)
         self.state = state
-        self.gputop_theme = theme
 
-    @property
-    def notes(self) -> tuple[str, ...]:
-        s = self.state.latest
-        return s.notes if s is not None and not self.state.lost else ()
+    def has_data(self) -> bool:
+        return any(v is not None for m in self.metrics for v in self.state.history[m].tail(512))
 
-    def update_data(self) -> None:
-        # One extra line per hint; only touch styles when it changes (relayout).
-        height = 2 + len(self.notes)
-        if getattr(self, "_height", None) != height:
-            self._height = height
-            self.styles.height = height
-        self.refresh()
 
-    def render_text(self) -> Text:
-        th = self.gputop_theme
-        st = self.state
-        info = st.info
-        s = st.latest
-        label, value, dim = th.style("main_fg"), th.style("title"), th.style("graph_text")
-        sep = (" · ", dim)
+class VramBox(DetailBox):
+    """btop mem-box style: totals, a used meter and the used history graph."""
 
-        first: list[tuple[str, Style]] = [(info.name, th.style("title", bold=True))]
-        if info.short_uuid:
-            first += [sep, (info.short_uuid, dim)]
-        if info.driver_version:
-            first += [sep, ("driver ", label), (info.driver_version, value)]
-        if s is not None and s.pcie_gen is not None:
-            link = f"Gen{s.pcie_gen} x{s.pcie_width}" if s.pcie_width else f"Gen{s.pcie_gen}"
-            first += [sep, ("PCIe ", label), (link, value)]
-            if info.pcie_gen_max:
-                first.append((f" (max Gen{info.pcie_gen_max} x{info.pcie_width_max})", dim))
-        if info.memory_total:
-            first += [sep, (fmt.bytes_short(info.memory_total) + " VRAM", value)]
+    color_key = "mem_box"
+    metrics = ("mem_percent",)
 
-        second: list[tuple[str, Style]] = []
-        if st.lost:
-            second = [("GPU no longer available: " + (st.error or ""), th.style("hi_fg", bold=True))]
-        elif s is None:
-            second = [("waiting for data…", th.style("inactive_fg"))]
-        else:
-            tags, warn = throttle_tags(s)
-            if tags:
-                second += [("throttle ", label),
-                           (" ".join(tags), th.grad("util", 1.0) if warn else th.style("inactive_fg"))]
-            elif s.throttle_reasons is not None:
-                second += [("throttle ", label), ("none", dim)]
-            for name, v in (s.engine_util or {}).items():
-                if second:
-                    second.append(("  ", dim))
-                second += [(name + " ", label), (fmt.pct(v), th.grad("util", v / 100))]
-            if s.enc_util is not None or s.dec_util is not None:
-                second += [sep, ("enc ", label), (fmt.pct(s.enc_util), value),
-                           ("  dec ", label), (fmt.pct(s.dec_util), value)]
-            nprocs = len(st.processes)
-            if second:
-                second.append(sep)
-            second += [(f"{nprocs} process{'es' if nprocs != 1 else ''}", value)]
-            if st.error:
-                second += [sep, (st.error, th.style("hi_fg"))]
+    def top_tabs(self):
+        return [Tab("vram")], None, []
 
-        rows = [first, second]
-        for note in self.notes:
-            rows.append([("⚠ ", th.style("hi_fg")), (note, th.style("inactive_fg"))])
-        lines = []
-        for parts in rows:
-            line = Text(no_wrap=True)
-            for t, style in parts:
-                line.append(t, style)
-            lines.append(line)
-        return join_lines(lines, self.content_size.width)
+    def bottom_tabs(self):
+        s = self.state.latest or _EMPTY
+        return [], ([Tab(f"{fmt.pct(s.mem_percent)} used", bold=False)] if s.mem_percent is not None else [])
+
+    def content(self, w, h):
+        th, s = self.gputop_theme, self.state.latest or _EMPTY
+        title, main = th.style("title", bold=True), th.style("main_fg")
+        rows = []
+
+        def kv(k, v, ks, vs):
+            t = Text(no_wrap=True)
+            t.append(k, ks)
+            t.append(v.rjust(max(0, w - len(k))), vs)
+            return t
+
+        rows.append(kv("Total:", fmt.gib(s.mem_total), title, title))
+        rows.append(kv("Used:", fmt.gib(s.mem_used), main, main))
+        if s.mem_percent is not None:
+            t = Text(f"{fmt.pct(s.mem_percent):>4} ", main)
+            t.append_text(btop_meter(s.mem_percent / 100, max(1, w - 5), th, "vram"))
+            rows.append(t)
+        if s.mem_total is not None and s.mem_used is not None:
+            rows.append(kv("Free:", fmt.gib(s.mem_total - s.mem_used), main, main))
+        rows = rows[:h]
+        gh = h - len(rows)
+        if gh > 0:
+            rows += labelled_graph(self.state.history["mem_percent"].tail(w * 2), w, gh, th, "vram", 100.0, None)
+        return rows
+
+
+class PcieBox(DetailBox):
+    """btop net-box style: download (RX) up, upload (TX) mirrored below."""
+
+    color_key = "net_box"
+    metrics = ("pcie_rx", "pcie_tx")
+
+    def top_tabs(self):
+        return [Tab("pcie")], None, []
+
+    def bottom_tabs(self):
+        s = self.state.latest or _EMPTY
+        link = f"Gen{s.pcie_gen} x{s.pcie_width}" if s.pcie_gen and s.pcie_width else None
+        return [], ([Tab(link, key="graph_text", bold=False)] if link else [])
+
+    def content(self, w, h):
+        th, st = self.gputop_theme, self.state
+        s = st.latest or _EMPTY
+        hist = st.history
+        vmax = max(hist["pcie_rx"].max(w * 2) or 0, hist["pcie_tx"].max(w * 2) or 0, 1e6)
+        main = th.style("main_fg")
+        top_h = (h + 1) // 2
+        bot_h = h - top_h
+        rx_label = Text("▼ ", main)
+        rx_label.append(fmt.rate(s.pcie_rx), th.style("title"))
+        tx_label = Text("▲ ", main)
+        tx_label.append(fmt.rate(s.pcie_tx), th.style("title"))
+        rows = labelled_graph(hist["pcie_rx"].tail(w * 2), w, top_h, th, "rx", vmax, rx_label)
+        if bot_h:
+            rows += labelled_graph(hist["pcie_tx"].tail(w * 2), w, bot_h, th, "tx", vmax, tx_label, invert=True)
+        scale = Text(fmt.rate(vmax), th.style("graph_text"))
+        if rows and w > scale.cell_len + 16:
+            rows[0] = overlay(rows[0], w - scale.cell_len, scale)
+        return rows
+
+
+class PowerTempBox(DetailBox):
+    """Power and temperature history, stacked."""
+
+    color_key = "cpu_box"
+    metrics = ("power_draw", "temp_core")
+
+    def top_tabs(self):
+        return [Tab("power"), Tab("temp")], None, []
+
+    def content(self, w, h):
+        th, st = self.gputop_theme, self.state
+        s, hist, info = st.latest or _EMPTY, st.history, st.info
+        main = th.style("main_fg")
+        has_p = any(v is not None for v in hist["power_draw"].tail(w * 2))
+        has_t = any(v is not None for v in hist["temp_core"].tail(w * 2))
+        ph = (h + 1) // 2 if has_p and has_t else (h if has_p else 0)
+        rows: list[Text] = []
+        if ph:
+            vmax = s.power_limit or info.power_limit_max or hist["power_draw"].max() or 1.0
+            lab = Text("power ", main)
+            lab.append(fmt.power_pair(s.power_draw, s.power_limit), th.style("title"))
+            rows += labelled_graph(hist["power_draw"].tail(w * 2), w, ph, th, "power", vmax, lab)
+        if has_t and h - ph > 0:
+            tmax = max(100.0, hist["temp_core"].max() or 0)
+            lab = Text("temp ", main)
+            lab.append(fmt.temp(s.temp_core), th.temp(s.temp_core) if s.temp_core is not None else main)
+            rows += labelled_graph(hist["temp_core"].tail(w * 2), w, h - ph, th, "temp", tmax, lab)
+        return rows
 
 
 class GpuDetail(Container):
-    """Single-GPU view: info bar plus six large metric graphs."""
+    """Single-GPU view: a big GPU box, then VRAM | PCIe | power/temp boxes."""
 
     DEFAULT_CSS = """
     GpuDetail { height: 1fr; layout: vertical; }
-    GpuDetail > #graphs { layout: grid; grid-size: 3 2; height: 1fr; }
+    GpuDetail > GpuPanel { height: 4fr; }
+    GpuDetail > #detail-row { height: 3fr; }
+    GpuDetail > #detail-row > DetailBox { width: 1fr; height: 1fr; }
     """
 
-    def __init__(self, state: DeviceState, theme: Theme, **kwargs) -> None:
+    def __init__(self, state: DeviceState, theme: Theme, hotkey: int | None = None, **kwargs) -> None:
         super().__init__(**kwargs)
         self.state = state
         self.gputop_theme = theme
-
-    # Value providers: each returns (values, vmin, vmax) for n samples.
-    def _hist(self, metric: str, vmax_fn: Callable[[], float]):
-        def source(n: int):
-            return self.state.history[metric].tail(n), 0.0, max(1e-9, vmax_fn())
-        return source
+        self.main = GpuPanel(state, theme, hotkey=hotkey, detail=True)
+        self.boxes: list[DetailBox] = [VramBox(state, theme), PcieBox(state, theme), PowerTempBox(state, theme)]
+        self._visible: tuple[bool, ...] | None = None
 
     def compose(self) -> ComposeResult:
-        st, th = self.state, self.gputop_theme
-        info = st.info
-        yield GpuInfoBar(st, th)
-
-        def latest() -> GPUSample:
-            return st.latest or GPUSample(index=st.index)
-
-        def T(*parts: tuple[str, str]) -> Text:  # noqa: N802 - tiny builder
-            t = Text()
-            for txt, key in parts:
-                t.append(txt, self.gputop_theme.style(key, bold=(key == "title")))
-            return t
-
-        def util_title():
-            s = latest()
-            sub = T(("mctl ", "main_fg"), (fmt.pct(s.util_mem), "title")) if s.util_mem is not None else None
-            return T(("util ", "main_fg"), (fmt.pct(s.util_gpu), "title")), sub
-
-        def vram_title():
-            s = latest()
-            return T(("vram ", "main_fg"), (fmt.mem_pair(s.mem_used, s.mem_total), "title")), \
-                T((fmt.pct(s.mem_percent), "title"))
-
-        def power_vmax() -> float:
-            s = latest()
-            return s.power_limit or info.power_limit_max or st.history["power_draw"].max() or 1.0
-
-        def power_title():
-            s = latest()
-            sub = T((fmt.pct(s.power_percent), "title")) if s.power_percent is not None else None
-            return T(("power ", "main_fg"), (fmt.power_pair(s.power_draw, s.power_limit), "title")), sub
-
-        def temp_title():
-            s = latest()
-            t = T(("temp ", "main_fg"), (fmt.temp(s.temp_core), "title"))
-            if s.temp_mem is not None:
-                t.append_text(T(("  mem ", "main_fg"), (fmt.temp(s.temp_mem), "title")))
-            if s.temp_hotspot is not None:
-                t.append_text(T(("  hot ", "main_fg"), (fmt.temp(s.temp_hotspot), "title")))
-            sub = T(("fan ", "main_fg"), (fmt.pct(s.fan), "title")) if s.fan is not None else None
-            return t, sub
-
-        def clock_vmax() -> float:
-            return float(info.clock_graphics_max or st.history["clock_graphics"].max() or 1)
-
-        def clock_title():
-            s = latest()
-            t = T(("gfx ", "main_fg"), (fmt.mhz(s.clock_graphics), "title"))
-            if info.clock_graphics_max:
-                t.append(f" / {info.clock_graphics_max}", self.gputop_theme.style("graph_text"))
-            sub = T(("mem ", "main_fg"), (fmt.mhz(s.clock_mem), "title")) if s.clock_mem is not None else None
-            return t, sub
-
-        def pcie_vmax() -> float:
-            # Shared autoscale for RX and TX so the two halves are comparable.
-            m = max(st.history["pcie_rx"].max(240) or 0, st.history["pcie_tx"].max(240) or 0)
-            return max(m, 1e6)
-
-        def pcie_title():
-            s = latest()
-            t = T(("pcie ", "main_fg"), ("↓", "download_end"), (fmt.rate(s.pcie_rx), "title"),
-                  ("  ↑", "upload_end"), (fmt.rate(s.pcie_tx), "title"))
-            sub = T((f"Gen{s.pcie_gen} x{s.pcie_width}", "graph_text")) if s.pcie_gen else None
-            return t, sub
-
-        # A box stays hidden while its metric has no data at all, so GPUs that
-        # can't report something (VRAM on Intel iGPUs, power without RAPL
-        # access, PCIe without a link...) don't show empty boxes.
-        temp_vmax = lambda: max(100.0, st.history["temp_core"].max() or 0)  # noqa: E731
-        boxes = [
-            MetricBox(util_title, self._hist("util_gpu", lambda: 100.0), th, "util", metrics=("util_gpu",)),
-            MetricBox(vram_title, self._hist("mem_percent", lambda: 100.0), th, "vram", metrics=("mem_percent",)),
-            MetricBox(power_title, self._hist("power_draw", power_vmax), th, "power", metrics=("power_draw",)),
-            MetricBox(temp_title, self._hist("temp_core", temp_vmax), th, "temp", metrics=("temp_core",)),
-            MetricBox(clock_title, self._hist("clock_graphics", clock_vmax), th, "util",
-                      metrics=("clock_graphics",)),
-            MetricBox(pcie_title, self._hist("pcie_rx", pcie_vmax), th, "rx",
-                      mirror_source=self._hist("pcie_tx", pcie_vmax), mirror_gradient="tx",
-                      metrics=("pcie_rx", "pcie_tx")),
-        ]
-        self._cols = 3
-        self._visible: tuple[bool, ...] | None = None
-        with Container(id="graphs"):
-            yield from boxes
+        yield self.main
+        with Horizontal(id="detail-row"):
+            yield from self.boxes
 
     def on_mount(self) -> None:
         self._sync_boxes()
 
     def _sync_boxes(self) -> None:
-        boxes = list(self.query(MetricBox))
-        visible = tuple(
-            any(v is not None for m in b.metrics for v in self.state.history[m].tail(512)) for b in boxes
-        )
-        if not any(visible):
-            visible = tuple(True for _ in boxes)  # nothing yet: keep the grid shape
+        visible = tuple(b.has_data() for b in self.boxes)
         if visible != self._visible:
             self._visible = visible
-            for box, show in zip(boxes, visible):
+            for box, show in zip(self.boxes, visible):
                 box.display = show
-            self.set_columns(self._cols)
-
-    def set_columns(self, cols: int) -> None:
-        self._cols = cols
-        graphs = self.query_one("#graphs")
-        n = sum(self._visible) if self._visible else 6
-        cols = max(1, min(cols, n))
-        rows = (n + cols - 1) // cols
-        graphs.styles.grid_size_columns = cols
-        graphs.styles.grid_size_rows = rows
+            self.query_one("#detail-row").display = any(visible)
 
     def apply_theme(self, theme: Theme) -> None:
         self.gputop_theme = theme
-        for w in self.query(MetricBox):
+        for w in [self.main, *self.boxes]:
             w.apply_theme(theme)
-        for w in self.query(GpuInfoBar):
-            w.gputop_theme = theme
-            w.refresh()
 
     def update_data(self) -> None:
         self._sync_boxes()
-        for w in self.query(MetricBox):
-            w.update_data()
-        for w in self.query(GpuInfoBar):
-            w.update_data()
+        for w in [self.main, *self.boxes]:
+            if w.display:
+                w.update_data()

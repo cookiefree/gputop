@@ -7,9 +7,10 @@ from textual import events
 from textual.app import ComposeResult
 from textual.containers import Center, Middle
 from textual.screen import ModalScreen
-from textual.widget import Widget
 
 from ..themes import Theme
+from .box import Tab
+from .gpu_panel import BoxWidget
 
 HELP_KEYS: tuple[tuple[str, str], ...] = (
     ("q / Esc", "quit"),
@@ -30,46 +31,37 @@ HELP_KEYS: tuple[tuple[str, str], ...] = (
 )
 
 
-class HelpBox(Widget):
+class HelpBox(BoxWidget):
+    """The key list, drawn as a btop box (btop's help uses the same chrome)."""
+
+    color_key = "div_line"
+    pad = 2
     DEFAULT_CSS = """
-    HelpBox {
-        width: 72;
-        height: auto;
-        max-width: 100%;
-        border: round white;
-        border-title-align: center;
-        border-subtitle-align: center;
-        padding: 1 2;
-    }
+    HelpBox { width: 74; max-width: 100%; }
     """
 
     def __init__(self, theme: Theme, extra: str = "", **kwargs) -> None:
-        super().__init__(**kwargs)
-        self.gputop_theme = theme
+        super().__init__(theme, **kwargs)
         self.extra = extra
+        self.styles.height = len(HELP_KEYS) + 2 + (2 if extra else 0) + 2
 
-    def on_mount(self) -> None:
+    def top_tabs(self):
+        return [Tab("help", hotkey=0)], None, []
+
+    def bottom_tabs(self):
+        return [Tab("press any key to close", key="graph_text", bold=False)], []
+
+    def content(self, w, h):
         th = self.gputop_theme
-        self.styles.border = ("round", th["hi_fg"])
-        self.styles.background = th["main_bg"]
-        self.border_title = Text("gputop help", th.style("title", bold=True))
-        self.border_subtitle = Text("press any key to close", th.style("graph_text"))
-
-    def get_content_height(self, container, viewport, width: int) -> int:
-        return len(HELP_KEYS) + (2 if self.extra else 0)
-
-    def render(self) -> Text:
-        th = self.gputop_theme
-        out = Text(no_wrap=True, overflow="ellipsis")
-        for i, (key, desc) in enumerate(HELP_KEYS):
-            if i:
-                out.append("\n")
-            out.append(f"{key:>16}  ", th.style("hi_fg", bold=True))
-            out.append(desc, th.style("main_fg"))
+        rows = [Text("")]
+        for key, desc in HELP_KEYS:
+            t = Text(no_wrap=True)
+            t.append(f"{key:>16}  ", th.style("hi_fg", bold=True))
+            t.append(desc, th.style("main_fg"))
+            rows.append(t)
         if self.extra:
-            out.append("\n\n")
-            out.append(self.extra, th.style("graph_text"))
-        return out
+            rows += [Text(""), Text(self.extra, th.style("graph_text"))]
+        return rows
 
 
 class HelpOverlay(ModalScreen[None]):

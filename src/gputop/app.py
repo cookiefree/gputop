@@ -1,30 +1,36 @@
-"""The Textual application: layout, key bindings, view switching."""
+"""The Textual application: btop-style tiled layout, key bindings, views.
+
+Like btop there is no outer frame and no gaps: the screen is tiled by boxes
+that touch each other. Overview: one box per GPU (stacked, full width; two
+columns for 3+ GPUs on wide terminals) above the process box. Detail view: a
+big box for one GPU, a row of VRAM / PCIe / power+temp boxes, then the
+process box.
+"""
 
 from __future__ import annotations
 
 import math
-import time
 
-from rich.text import Text
 from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container
 from textual.message import Message
-from textual.widgets import Input
 
 from . import __version__
 from .config import Config
 from .sampler import Sampler
 from .themes import Theme
-from .widgets.common import LinesWidget, reset_titles, set_title
+from .widgets.box import BoxStyle
 from .widgets.gpu_panel import GpuDetail, GpuPanel
 from .widgets.help_overlay import HelpOverlay
 from .widgets.process_table import ProcessTable
 
 INTERVAL_STEPS_MS = (100, 200, 250, 500, 750, 1000, 1500, 2000, 3000, 5000)
-PANEL_MIN_WIDTH = 38
-PROC_MIN_HEIGHT = 6  # border + header + 3 rows
+PROC_MIN_HEIGHT = 8  # process box: borders + header + 5 rows
+GPU_SHARE = 0.65  # share of the height for 1-2 GPU boxes
+MIN_BOX_HEIGHT = 3  # top border + 1 row + bottom border
+TWO_COLUMN_WIDTH = 160
 
 
 class SampleReady(Message):
@@ -35,110 +41,34 @@ class SampleReady(Message):
         self.generation = generation
 
 
-class FilterBar(Input):
-    """One-line process filter docked at the bottom of the frame."""
-
-    BINDINGS = [Binding("escape", "cancel", "clear filter", show=False)]
-
-    class Cancelled(Message):
-        pass
-
-    def action_cancel(self) -> None:
-        self.post_message(self.Cancelled())
-
-
-class TopBar(LinesWidget):
-    """The frame's top edge, drawn as its own 1-row widget.
-
-    Keeping the ticking clock out of the frame's border title means a clock
-    update repaints one row instead of the whole screen.
-    """
-
-    DEFAULT_CSS = "TopBar { height: 1; }"
-
-    def __init__(self, theme: Theme, **kwargs) -> None:
-        super().__init__(**kwargs)
-        self.gputop_theme = theme
-        self.left = Text()
-        self.right = Text()
-
-    def set_parts(self, left: Text, right: Text) -> None:
-        if (left.plain, right.plain, left.spans, right.spans) != (
-            self.left.plain, self.right.plain, self.left.spans, self.right.spans
-        ):
-            self.left, self.right = left, right
-            self.refresh()
-
-    def render_text(self) -> Text:
-        th = self.gputop_theme
-        edge = th.style("graph_text")
-        w = self.content_size.width
-        line = Text(no_wrap=True)
-        line.append("╭─ ", edge)
-        line.append_text(self.left)
-        tail_len = self.right.cell_len + 4  # " " + right + " ─╮"
-        gap = w - line.cell_len - tail_len - 1
-        if gap >= 1:
-            line.append(" " + "─" * gap + " ", edge)
-            line.append_text(self.right)
-            line.append(" ─╮", edge)
-        else:
-            line.append(" " + "─" * max(0, w - line.cell_len - 2), edge)
-            line.append("╮", edge)
-        line.truncate(w)
-        return line
-
-
 def overview_layout(n: int, width: int, height: int, with_table: bool = True) -> tuple[int, int, int]:
-    """(columns, rows, panel_height) for ``n`` GPU panels in ``width``x``height``.
+    """(columns, rows, box_height) for ``n`` GPU boxes on a ``width``x``height`` screen.
 
-    Panels are at least ``PANEL_MIN_WIDTH`` wide. Their height shrinks towards
-    3 rows (1 content line) on small terminals and grows up to 12 on tall ones
-    so graphs get taller, always leaving room for the process table. Without
-    a process table (no device has per-process data) panels fill the height.
+    1-2 GPUs: stacked, together ~65 % of the height. 3+ GPUs: two columns if
+    the terminal is at least 160 wide, and the process box shrinks to its
+    minimum. All GPU boxes have the same height; spare rows go to the
+    process box. Without a process box the GPU boxes fill the screen.
     """
     n = max(1, n)
-    cols = max(1, min(n, width // PANEL_MIN_WIDTH))
+    cols = 2 if n >= 3 and width >= TWO_COLUMN_WIDTH else 1
     rows = math.ceil(n / cols)
     if not with_table:
-        return cols, rows, max(3, height // rows)
-    avail = max(3 * rows, height - PROC_MIN_HEIGHT)
-    ideal = max(6, min(12, (height * 55 // 100) // rows))
-    ph = max(3, min(ideal, avail // rows))
-    return cols, rows, ph
+        return cols, rows, max(MIN_BOX_HEIGHT, height // rows)
+    target = round(height * GPU_SHARE) if n <= 2 else height - PROC_MIN_HEIGHT
+    target = min(target, height - PROC_MIN_HEIGHT)
+    return cols, rows, max(MIN_BOX_HEIGHT, target // rows)
 
 
 class GpuTopApp(App[None]):
     TITLE = "gputop"
     ENABLE_COMMAND_PALETTE = False
-    AUTO_FOCUS = None  # the (hidden) filter input must not grab keys on start
+    AUTO_FOCUS = None
 
     CSS = """
-    Screen { layout: vertical; }
-    #frame {
-        height: 1fr;
-        border: round white;
-        border-top: none;
-        border-subtitle-align: right;
-        layout: vertical;
-    }
-    #overview {
-        layout: grid;
-        grid-size: 2;
-        grid-gutter: 0 1;
-        height: auto;
-        overflow-y: auto;
-    }
-    #overview > GpuPanel { height: 1fr; }
-    #detail-host { height: 2fr; display: none; }
-    ProcessTable { height: 1fr; min-height: 4; }
-    #filter {
-        dock: bottom;
-        display: none;
-        height: 1;
-        border: none;
-        padding: 0 1;
-    }
+    Screen { layout: vertical; padding: 0; }
+    #overview { layout: grid; grid-size: 1; grid-gutter: 0; height: auto; overflow-y: auto; }
+    #detail-host { height: 1fr; display: none; }
+    ProcessTable { height: 1fr; min-height: 3; }
     """
 
     BINDINGS = [
@@ -172,12 +102,16 @@ class GpuTopApp(App[None]):
         config: Config | None = None,
         backend_label: str = "",
     ) -> None:
-        super().__init__()
+        config = config or Config()
+        # theme_background = false: let the terminal's own (default) background
+        # through; Textual otherwise converts "default" to an RGB colour.
+        super().__init__(ansi_color=not config.theme_background)
         self.sampler = sampler
         self.themes = themes
         self.theme_order = self._theme_order(themes)
-        self.gtheme = themes.get(theme_name) or themes["default"]
-        self.config = config or Config()
+        self.config = config
+        BoxStyle.rounded = self.config.rounded_corners
+        self.gtheme = (themes.get(theme_name) or themes["default"]).with_background(self.config.theme_background)
         self.backend_label = backend_label
         self.changes: dict[str, object] = {}
         self.focus_pos = 0
@@ -197,26 +131,18 @@ class GpuTopApp(App[None]):
     def compose(self) -> ComposeResult:
         # Keep direct references: handlers run on every tick, and DOM queries
         # fail if a message arrives while the app is shutting down.
-        self.topbar = TopBar(self.gtheme)
-        self.frame = Container(id="frame")
         self.overview = Container(id="overview")
         self.detail_host = Container(id="detail-host")
-        self.table = ProcessTable(
-            self.gtheme, sort_key=self.config.sort_key, sort_reverse=self.config.sort_reverse
-        )
-        self.filter_bar = FilterBar(
-            placeholder="filter by command, user or PID · Enter keep · Esc clear", id="filter"
-        )
-        yield self.topbar
-        with self.frame:
-            with self.overview:
-                for pos, dev in enumerate(self.sampler.devices):
-                    panel = GpuPanel(dev, self.gtheme, hotkey=pos + 1 if pos < 9 else None)
-                    self.panels.append(panel)
-                    yield panel
-            yield self.detail_host
-            yield self.table
-            yield self.filter_bar
+        self.table = ProcessTable(self.gtheme, sort_key=self.config.sort_key,
+                                  sort_reverse=self.config.sort_reverse)
+        with self.overview:
+            for pos, dev in enumerate(self.sampler.devices):
+                panel = GpuPanel(dev, self.gtheme, hotkey=pos + 1 if pos < 9 else None)
+                panel.interval_ms = self._interval_ms
+                self.panels.append(panel)
+                yield panel
+        yield self.detail_host
+        yield self.table
 
     @property
     def _live(self) -> bool:
@@ -224,12 +150,31 @@ class GpuTopApp(App[None]):
         table = getattr(self, "table", None)
         return table is not None and table.is_attached and not self._exit
 
+    def _interval_ms(self) -> int:
+        return round(self.sampler.interval * 1000)
+
+    @property
+    def clock_box(self) -> GpuPanel | None:
+        """The box whose top border carries the clock and interval (btop's cpu box)."""
+        if self._detail is not None:
+            return self._detail.main
+        return self.panels[0] if self.panels else None
+
+    def _place_clock(self) -> None:
+        clock = self.clock_box
+        for panel in [*self.panels, *([self._detail.main] if self._detail else [])]:
+            want = panel is clock
+            if panel.show_clock != want:
+                panel.show_clock = want
+                panel.refresh()
+
     def on_mount(self) -> None:
         self.sampler.on_update = lambda gen: self.post_message(SampleReady(gen))
         self.apply_theme(self.gtheme)
         if self.panels:
             self.panels[0].set_selected(True)
-        self.set_interval(1.0, self.update_header)
+        self._place_clock()
+        self.set_interval(1.0, self._tick_clock)
         if self.detail_mode:
             self.call_after_refresh(self._enter_detail)
         self.call_after_refresh(self._sync_table_visibility)
@@ -240,32 +185,27 @@ class GpuTopApp(App[None]):
         self.sampler.on_update = None
         self.sampler.stop()
 
+    def _tick_clock(self) -> None:
+        if self._live and self.clock_box is not None:
+            self.clock_box.refresh_top()
+
     # -- data updates ---------------------------------------------------------
 
     def on_sample_ready(self, message: SampleReady) -> None:
         if not self._live:
             return
-        for panel in self.panels:
-            panel.update_data()
+        if not self.detail_mode:
+            for panel in self.panels:
+                panel.update_data()
         if self._detail is not None:
             self._detail.update_data()
+        self.table.mem_totals = {d.index: d.info.memory_total for d in self.sampler.devices
+                                 if d.info.memory_total}
         self.table.set_processes(self.sampler.all_processes())
         self._sync_table_visibility()
-        cap = self._panel_cap()
-        if cap != getattr(self, "_last_cap", None):
-            self._last_cap = cap
-            self._last_layout = None
-            self.relayout()
-
-    def _panel_cap(self) -> int | None:
-        """Max useful panel content height if no panel has graphs, else None."""
-        caps = [p.max_content_rows() for p in self.panels]
-        if not caps or any(c is None for c in caps):
-            return None
-        return max(caps)
 
     def _table_wanted(self) -> bool:
-        """Show the process table only if a GPU in view has per-process data
+        """Show the process box only if a GPU in view has per-process data
         (hidden e.g. for Intel GPUs on kernels without DRM fdinfo)."""
         if self.detail_mode and self.panels:
             scope = [self.panels[self.focus_pos].state]
@@ -297,85 +237,44 @@ class GpuTopApp(App[None]):
     def relayout(self) -> None:
         if not self._live:
             return
-        frame = self.frame
-        w, h = frame.content_size
+        w, h = self.screen.size
         if w <= 0 or h <= 0:
             return
         # History must cover the widest possible graph (2 samples per cell).
         if self.sampler.history_len < w * 2:
             self.sampler.set_history_len(w * 2 + 64)
         with_table = bool(self.table.display)
-        cols, rows, ph = overview_layout(len(self.panels), w, h, with_table)
-        cap = self._panel_cap()
-        if cap is not None:
-            ph = min(ph, cap + 2)  # + border
-        key = (w, h, cols, rows, ph, self.detail_mode, with_table)
-        if key != self._last_layout:
-            self._last_layout = key
-            overview = self.overview
-            overview.styles.grid_size_columns = cols
-            overview.set_styles(f"grid-rows: {ph};")
-            reserve = PROC_MIN_HEIGHT if with_table else 0
-            overview.styles.height = min(rows * ph, max(3, h - reserve))
-            if self._detail is not None:
-                self._detail.set_columns(3 if w >= 110 or h < 30 else 2)
-        self.update_header()
-
-    def update_header(self) -> None:
-        if not self._live:
+        cols, rows, box_h = overview_layout(len(self.panels), w, h, with_table)
+        key = (w, h, cols, rows, box_h, self.detail_mode, with_table)
+        if key == self._last_layout:
             return
-        th = self.gtheme
-        frame = self.frame
-        right = Text()
-        if self.backend_label:
-            right.append(self.backend_label, th.style("graph_text"))
-            right.append(" ─ ", th.style("div_line"))
-        ms = round(self.sampler.interval * 1000)
-        right.append(f"{ms}ms", th.style("title"))
-        right.append(" ─ ", th.style("div_line"))
-        right.append(time.strftime("%H:%M:%S"), th.style("title", bold=True))
-
-        left = Text()
-        left.append("gputop", th.style("title", bold=True))
-        mode = "detail" if self.detail_mode else f"{len(self.panels)} GPU{'s' if len(self.panels) != 1 else ''}"
-        left.append(f" {mode}", th.style("hi_fg"))
-
-        self.topbar.set_parts(left, right)
-
-        hints = Text()
-        for i, (key, label) in enumerate(
-            (("h", "help"), ("a", "view"), ("s", "sort"), ("f", "filter"), ("t", "theme"), ("q", "quit"))
-        ):
-            if i:
-                hints.append("  ")
-            hints.append(key, th.style("hi_fg", bold=True))
-            hints.append(" " + label, th.style("main_fg"))
-        set_title(frame, "border_subtitle", hints)
+        self._last_layout = key
+        overview = self.overview
+        overview.styles.grid_size_columns = cols
+        if with_table:
+            overview.set_styles(f"grid-rows: {box_h};")
+            # Equal-height boxes; spare rows go to the process box. Too many
+            # GPUs for the screen: the GPU area scrolls.
+            overview.styles.height = min(rows * box_h, max(MIN_BOX_HEIGHT, h - 4))
+        else:
+            overview.set_styles("grid-rows: 1fr;")
+            overview.styles.height = h
+        if self._detail is not None:
+            proc = max(PROC_MIN_HEIGHT, round(h * 0.3)) if with_table else 0
+            self.detail_host.styles.height = max(MIN_BOX_HEIGHT, h - proc)
 
     # -- theme ----------------------------------------------------------------
 
     def apply_theme(self, theme: Theme) -> None:
+        theme = theme.with_background(self.config.theme_background)
         self.gtheme = theme
-        self.screen.styles.background = theme["main_bg"]
+        self.screen.styles.background = theme["main_bg"] if theme.background else "ansi_default"
         self.screen.styles.color = theme["main_fg"]
-        frame = self.frame
-        edge = theme["graph_text"]
-        frame.styles.border_left = ("round", edge)
-        frame.styles.border_right = ("round", edge)
-        frame.styles.border_bottom = ("round", edge)
-        reset_titles(frame)
-        topbar = self.topbar
-        topbar.gputop_theme = theme
-        topbar.refresh()
         for panel in self.panels:
             panel.apply_theme(theme)
         if self._detail is not None:
             self._detail.apply_theme(theme)
         self.table.apply_theme(theme)
-        flt = self.filter_bar
-        flt.styles.background = theme["selected_bg"]
-        flt.styles.color = theme["selected_fg"]
-        self.update_header()
 
     def action_cycle_theme(self) -> None:
         try:
@@ -430,22 +329,22 @@ class GpuTopApp(App[None]):
     def _enter_detail(self) -> None:
         if not self._live:
             return
-        host = self.detail_host
-        overview = self.overview
         state = self.panels[self.focus_pos].state
         if self._detail is None or self._detail_pos != self.focus_pos:
             if self._detail is not None:
                 self._detail.remove()
-            self._detail = GpuDetail(state, self.gtheme)
+            self._detail = GpuDetail(state, self.gtheme, hotkey=self.focus_pos + 1)
+            self._detail.main.interval_ms = self._interval_ms
+            self._detail.main.selected = True
             self._detail_pos = self.focus_pos
-            host.mount(self._detail)
-            w, h = self.frame.content_size
-            self.call_after_refresh(self._detail.set_columns, 3 if w >= 110 or h < 30 else 2)
-        overview.display = False
-        host.display = True
+            self.detail_host.mount(self._detail)
+        self.overview.display = False
+        self.detail_host.display = True
         self.table.set_gpu_filter(state.index)
+        self._place_clock()
         self._sync_table_visibility()
-        self.update_header()
+        self._last_layout = None
+        self.call_after_refresh(self.relayout)
 
     def _exit_detail(self) -> None:
         if self._detail is not None:
@@ -455,10 +354,12 @@ class GpuTopApp(App[None]):
         self.detail_host.display = False
         self.overview.display = True
         self.table.set_gpu_filter(None)
+        self._place_clock()
+        for panel in self.panels:
+            panel.update_data()
         self._sync_table_visibility()
-        self.update_header()
 
-    # -- process table --------------------------------------------------------
+    # -- process box ----------------------------------------------------------
 
     def action_cycle_sort(self) -> None:
         self.table.cycle_sort()
@@ -481,35 +382,13 @@ class GpuTopApp(App[None]):
         self.table.select_edge(bool(end))
 
     def action_filter(self) -> None:
-        flt = self.filter_bar
-        flt.display = True
-        flt.value = self.table.filter_text
-        flt.focus()
-
-    @on(Input.Changed, "#filter")
-    def _filter_changed(self, event: Input.Changed) -> None:
-        self.table.set_filter(event.value)
-
-    @on(Input.Submitted, "#filter")
-    def _filter_submitted(self, event: Input.Submitted) -> None:
-        self._close_filter(keep=True)
-
-    @on(FilterBar.Cancelled)
-    def _filter_cancelled(self) -> None:
-        self._close_filter(keep=False)
-
-    def _close_filter(self, keep: bool) -> None:
-        flt = self.filter_bar
-        if not keep:
-            flt.value = ""
-            self.table.set_filter("")
-        flt.display = False
-        self.set_focus(None)
+        if self.table.display:
+            self.table.start_edit()
 
     # -- misc -----------------------------------------------------------------
 
     def action_interval(self, direction: int) -> None:
-        current = round(self.sampler.interval * 1000)
+        current = self._interval_ms()
         if direction < 0:
             smaller = [s for s in INTERVAL_STEPS_MS if s < current]
             new = smaller[-1] if smaller else INTERVAL_STEPS_MS[0]
@@ -518,7 +397,8 @@ class GpuTopApp(App[None]):
             new = larger[0] if larger else INTERVAL_STEPS_MS[-1]
         self.sampler.interval = new / 1000
         self.changes["interval_ms"] = new
-        self.update_header()
+        if self.clock_box is not None:
+            self.clock_box.refresh_top()
 
     def action_help(self) -> None:
         extra = f"gputop {__version__} · backend {self.backend_label or self.sampler.backend.name}"

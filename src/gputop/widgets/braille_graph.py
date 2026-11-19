@@ -117,7 +117,9 @@ def render_graph(
         for c in range(width):
             dl = dots[2 * c] - offset
             dr = dots[2 * c + 1] - offset
-            ch = braille_char(dl, dr, invert)
+            dl = 0 if dl < 0 else (4 if dl > 4 else dl)
+            dr = 0 if dr < 0 else (4 if dr > 4 else dr)
+            ch = _CELL[(dl, dr, invert)]
             if height == 1:
                 pos = max(norms[2 * c], norms[2 * c + 1])
             else:

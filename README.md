@@ -1,33 +1,45 @@
 # gputop
 
 A **btop-style multi-GPU terminal monitor** for Linux. Think "btop, but the
-whole screen is GPU stats": rounded boxes, braille history graphs with
-green → yellow → red gradients, gradient meters, a sortable process list, mouse
-support and themes. It handles any number of GPUs at once.
+whole screen is GPU stats". It is drawn the way btop draws (checked against a
+capture of btop 1.4.8): tiled boxes with titles in the border (`┐¹gpu0┌`),
+btop's Default colours, braille area graphs with vertical gradients, `■`
+meters, a sortable process box, mouse support and btop-format themes. It
+handles any number of GPUs at once.
 
 ```
-╭─ gputop 2 GPUs ─────────────────────────── nvidia 555.42 ─ 500ms ─ 12:34:56 ─╮
-│╭─ ¹GPU 0 · RTX 4090 ────────────────╮ ╭─ ²GPU 1 · RTX 3060 ─────────────────╮│
-││ util  ⣶⣶⡆   ⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶         89% │ │ util     ⢰⣴⣦⣤⣤⣀⣀⣤                4% ││
-││       ⣿⣿⣧⣄⣤⣤⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿             │ │       ⣀⣀⣀⣸⣿⣿⣿⣿⣿⣿⣿⣀⣀⣄⣠⣄⣀             ││
-││ vram  █████▌░░░░░░░░░░ 8.3/24.0 GB │ │ vram  █▋░░░░░░░░░░░░░░░ 1.2/12.0 GB ││
-││ power ⣶⣶⡆   ⣶⣶⣾⣶⣶⣶⣶⣶⣾⣶    395/450W │ │ power    ⢰⣶⣶⣦⣶⣤⣤⣤           18/170W ││
-││ temp 74°C  mem 82°C  fan 54%       │ │ temp 31°C  mem 39°C  fan 0%  315MHz ││
-││ pcie  ↓2.5 GB/s  ↑1.6 GB/s         │ │ pcie  ↓125 MB/s  ↑80.6 MB/s         ││
-│╰──────────────────────────── ⚠ PWR ─╯ ╰────────────────────────────── idle ─╯│
-│╭─ processes ────────────────────────────────────────────────────────────────╮│
-││ PID     USER      COMMAND                       GPU    VRAM▼  SM% TYPE     ││
-││ 4211    nik       ollama serve                    0     6.2G   81 Compute  ││
-││ 1337    nik       /usr/lib/Xorg :0                0   412.0M    3 Graphics ││
-│╰────────────────────────────────────────────────────────────────── 2 procs ─╯│
-╰────────────────────────── h help  a view  s sort  f filter  t theme  q quit ─╯
+╭─┐¹gpu0┌┐RTX 4090┌──┐help┌─────────┐13:48:11┌─────────────────────┐- 500ms +┌─╮
+│ util           ⣴⣶⣶⣶⣶⣶⣦⣴⣶⣶⣶⣤⣴⣶⣶⣴⣶⣶⣴⣦⣦ │vram  ■■■■■■■■■■■■■■■■■■■■■ 11.0/24.0G │
+│                ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿ │util  ■■■■■■■■■■■■■■■■■■■■■        90% │
+│                ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿ │power ■■■■■■■■■■■■■■■■■■■■■   400/450W │
+│             ⣤⣤⣦⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿ │temp 78°C  mem 86°C  fan 60%           │
+│ power          ⣶⣶⣶⣿⣷⣶⣷⣾⣶⣾⣶⣶⣾⣷⣶⣶⣶⣶⣶⣶⣶ │clk  2790 MHz  mem 10501 MHz           │
+│             ⣠⣤⣤⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿ │pcie  ▼42.1MB/s  ▲502MB/s  Gen4x16     │
+╰┘nvidia 555.42.02└───────────────────────────────────────────────────┘3 procs└╯
+╭─┐²gpu1┌┐RTX 3060┌────────────────────────────────────────────────────────────╮
+│ util        ⣠⣤⣦⣤⣀⡀⡀                  │vram  ■■■■■■■■■■■■■■■■■■■■■  3.7/12.0G │
+│             ⣿⣿⣿⣿⣿⣿⣿                  │util  ■■■■■■■■■■■■■■■■■■■■■         4% │
+│             ⣿⣿⣿⣿⣿⣿⣿                  │power ■■■■■■■■■■■■■■■■■■■■■    17/170W │
+│             ⣿⣿⣿⣿⣿⣿⣿⣀⣠⣀⣦⣶⣆⣄⣀⣀⣀⣀⣀⣠⣤⣤⣄⣀ │temp 35°C  mem 43°C  fan 0%            │
+│ power       ⣴⣶⣶⣶⣦⣤⣦                  │clk  295 MHz  mem 7501 MHz             │
+│             ⣿⣿⣿⣿⣿⣿⣿⣀⣀⣀⣄⣤⣄⣀⣀⣀⣀⣀⣀⣠⣠⣤⣄⣀ │pcie  ▼5.9MB/s  ▲21.3MB/s  Gen4x16     │
+╰┘nvidia 555.42.02└─────────────────────────────────────────────┘idle└┘2 procs└╯
+╭─┐proc┌┐filter┌─────────────────────────────────────────┐reverse┌┐sort: vram┌─╮
+│    Pid: User:     Command:                      Gpu:   Vram ↓   Sm% Type:    │
+│    5962 nik       /home/user/.steam/ubuntu12_3…    0     4.7G    37 Graphics │
+│    6722 root      /usr/lib/firefox/firefox -co…    0     3.8G    27 Graphics │
+│    6173 nik       /usr/bin/kwin_wayland --wayl…    1     2.5G     2 Graphics │
+│    4021 alice     /usr/lib/firefox/firefox -co…    0     2.2G    62 Graphics │
+│    4850 ci-runner python train.py --model llam…    1   972.5M     3 Compute  │
+╰┘↑ select ↓└┘detail ↵└┘theme t└┘help h└┘quit q└──────────────────────────┘0/5└╯
 ```
 
 ## Features
 
-- **All-GPUs overview**: one boxed panel per GPU, laid out in a grid that adapts
-  to the terminal size. Panels grow taller graphs on big terminals and collapse
-  to one or two lines on small ones (usable from 80x24; works down to ~40x10).
+- **All-GPUs overview**: one box per GPU (like btop's cpu box): util and power
+  graphs on the left, a stats panel on the right. Boxes tile the screen with no
+  gaps; 1-2 GPUs take ~65 % of the height, 3+ GPUs use two columns from 160
+  columns wide, and the process box keeps at least 8 rows (usable from 80x24).
 - **Single-GPU detail view** (`a`): six large graphs (utilisation, VRAM, power,
   temperature, clocks, PCIe RX/TX mirrored) plus the process list filtered to
   that GPU.
@@ -129,7 +141,7 @@ clients are rediscovered every 5 seconds.
 | `a` / `Enter` | toggle all-GPUs overview ↔ single-GPU detail view |
 | `↑` `↓` `PgUp` `PgDn` `Home` `End` | select process |
 | `s` / `r` | cycle sort column / reverse sort |
-| `f` (or `/`) | filter processes by command, user or PID (`Enter` keeps, `Esc` clears) |
+| `f` (or `/`) | filter processes by command, user or PID, typed into the `┐filter:┌` tab (`Enter` keeps, `Esc` clears) |
 | `+` / `-` | refresh faster / slower (100 ms – 5 s) |
 | `t` | cycle theme |
 | `h` / `?` | help overlay |
@@ -154,12 +166,21 @@ color = "auto"         # auto, truecolor, 256, 16
 ```
 
 Settings you change *inside the app* (theme, interval, sort, view) are saved on
-exit. Command-line flags only apply to that run.
+exit. Command-line flags only apply to that run. Two btop options are
+supported with btop's defaults:
+
+```toml
+rounded_corners = true    # false: square corners ┌ ┐ └ ┘
+theme_background = true   # false: keep the terminal's own background
+```
 
 ### Themes
 
-Drop files into `~/.config/gputop/themes/`. The file name is the theme name.
-btop theme files work unchanged:
+Themes use **btop's `.theme` format**, which is also how the built-in themes
+ship (`src/gputop/theme_files/*.theme`; `default.theme` is btop's own Default
+theme). Drop files into `~/.config/gputop/themes/`; the file name is the theme
+name, and btop theme files work unchanged (`cp /usr/share/btop/themes/*.theme
+~/.config/gputop/themes/`):
 
 ```
 # ~/.config/gputop/themes/mocha.theme
@@ -172,20 +193,26 @@ theme[cpu_mid]="#f9e2af"
 theme[cpu_end]="#f38ba8"
 ```
 
-or TOML (`mocha.toml`) with the same keys under `[colors]`. Colours can be
-`#rrggbb`, `#gg` (grey) or `"r g b"`. Missing keys fall back to `default`.
-`--theme` also accepts a path to a theme file.
+A TOML variant (`mocha.toml`, same keys under `[colors]`) also works. Colours
+can be `#rrggbb`, `#gg` (grey) or `"r g b"`. Missing keys fall back to
+`default.theme`. `--theme` also accepts a path to a theme file.
 
-| Gradient | Keys | Used for |
-| --- | --- | --- |
-| util | `cpu_start/mid/end` | utilisation, clocks |
-| vram / power | `vram_*` / `power_*` (fall back to `cpu_*`) | VRAM and power bars/graphs |
-| temp | `temp_*` | temperatures, fan |
-| rx / tx | `download_*` / `upload_*` | PCIe throughput |
-| proc | `process_*` | process SM % |
+How btop's keys map onto gputop:
 
-Box colours: `cpu_box` (GPU panels), `proc_box` (process list), `hi_fg`
-(focused panel, highlights), `graph_text` (outer frame, secondary text).
+| btop keys | gputop use |
+| --- | --- |
+| `cpu_start/mid/end` | GPU utilisation, power, encoder/decoder, memory controller |
+| `used_*` | VRAM (override with `vram_*`) |
+| `temp_*` | temperatures (0 °C … 90 °C) and fan |
+| `download_*` / `upload_*` | PCIe RX / TX |
+| `process_*` | per-process VRAM and SM % |
+| `free_*`, `cached_*`, `available_*` | parsed for btop parity |
+| `cpu_box`, `mem_box`, `net_box`, `proc_box` | GPU, VRAM, PCIe and process boxes |
+| `div_line` | inner stats box and dividers |
+| `hi_fg`, `title`, `graph_text`, `meter_bg`, `selected_*`, `inactive_fg` | as in btop |
+
+Box border colours never change with state; warnings (`PWR`, `THRM`, `LOST`)
+appear as tags in the bottom border.
 
 ## Screenshots / recordings
 
@@ -225,6 +252,7 @@ src/gputop/
     ├── gpu_panel.py     GPU panel, detail view, metric boxes
     ├── process_table.py sortable/filterable process list
     ├── help_overlay.py  help screen
+    ├── box.py           btop box chrome: ┐titles┌ in borders, hotkeys, clock
     └── common.py        Line-API base widget and small helpers
 ```
 
@@ -266,9 +294,9 @@ process measured:
 
 | Terminal | GPUs | CPU |
 | --- | --- | --- |
-| 80x24 | 2 | ~2–2.5 % |
-| 140x40 | 3 | ~2.9 % |
-| 200x50 | 4 | ~3.5 % |
+| 80x24 | 2 | ~2.2 % |
+| 140x40 | 3 | ~3.3 % |
+| 200x50 | 4 | ~4.7 % |
 
 Cost scales with the number of cells redrawn per tick. At 1 s it's about half
 that, and at 5 s it's ~0.6 %. 256-colour mode costs slightly more because

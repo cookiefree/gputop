@@ -31,6 +31,8 @@ class Config:
     sort_reverse: bool = False
     view: str = "all"  # "all" or "detail"
     color: str = "auto"  # auto, truecolor, 256, 16
+    rounded_corners: bool = True  # btop's default; false draws square corners
+    theme_background: bool = True  # false: keep the terminal's own background
 
     @classmethod
     def load(cls, path: Path | None = None) -> Config:

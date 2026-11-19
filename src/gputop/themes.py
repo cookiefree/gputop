@@ -1,34 +1,34 @@
-"""Colour themes.
+"""Colour themes in btop's ``.theme`` format.
 
-Themes use **btop's colour keys**, so existing btop ``.theme`` files load
-unchanged. Two file formats are accepted from ``~/.config/gputop/themes/``:
-
-btop style (``mytheme.theme``)::
+btop's theme format is the source of truth: the built-in themes are plain
+``.theme`` files shipped in ``gputop/theme_files/`` (``default.theme`` is btop's
+own Default theme), and any btop theme file works unchanged. User themes go in
+``~/.config/gputop/themes/``::
 
     theme[main_bg]="#1e1e2e"
     theme[cpu_start]="#a6e3a1"
 
-TOML (``mytheme.toml``)::
-
-    [colors]
-    main_bg = "#1e1e2e"
-    cpu_start = "#a6e3a1"
-
+A TOML variant (``[colors]`` table with the same keys) is also accepted.
 Colour values may be ``#rrggbb``, ``#gg`` (greyscale, btop shorthand) or
-``"r g b"`` decimal. Missing keys fall back to the ``default`` theme.
+``"r g b"`` decimal. Missing keys fall back to ``default.theme``.
 
-Gradients used by gputop (each has ``_start``, ``_mid`` and ``_end``):
+How gputop uses btop's keys:
 
-=========  =====================  ==========================================
-gputop     btop key prefix        used for
-=========  =====================  ==========================================
-util       ``cpu``                utilisation graphs, clocks, meters
-vram       ``vram`` -> ``cpu``    VRAM meter/graph (own key optional)
-power      ``power`` -> ``cpu``   power meter/graph (own key optional)
-temp       ``temp``               temperatures, fan
-rx / tx    ``download``/``upload``  PCIe throughput
-proc       ``process``            per-process SM% bars
-=========  =====================  ==========================================
+=============  =======================  =====================================
+gradient       btop key prefix          used for
+=============  =======================  =====================================
+util           ``cpu``                  GPU utilisation, enc/dec, mctl, clocks
+power          ``power`` -> ``cpu``     power meter and graph
+vram           ``vram`` -> ``used``     VRAM meter and graph
+temp           ``temp``                 temperatures, fan
+rx / tx        ``download``/``upload``  PCIe RX / TX
+proc           ``process``              per-process VRAM and SM%
+free/cached/   same names               (available for themes; btop parity)
+available
+=============  =======================  =====================================
+
+Boxes: ``cpu_box`` (GPU boxes), ``mem_box`` (VRAM), ``net_box`` (PCIe),
+``proc_box`` (processes), ``div_line`` (inner dividers).
 """
 
 from __future__ import annotations
@@ -37,153 +37,32 @@ import re
 import tomllib
 from dataclasses import dataclass, field
 from functools import cached_property
+from importlib import resources
 from pathlib import Path
 
+from rich.color import Color
 from rich.style import Style
 
 GRADIENTS: dict[str, tuple[str, ...]] = {
     # gputop gradient name -> btop key prefixes to try, in order
     "util": ("cpu",),
-    "vram": ("vram", "cpu"),
     "power": ("power", "cpu"),
+    "vram": ("vram", "used"),
     "temp": ("temp",),
     "rx": ("download",),
     "tx": ("upload",),
     "proc": ("process",),
+    "free": ("free",),
+    "cached": ("cached",),
+    "available": ("available",),
+    "used": ("used",),
 }
 
-DEFAULT_COLORS: dict[str, str] = {
-    "main_bg": "#000000",
-    "main_fg": "#cccccc",
-    "title": "#eeeeee",
-    "hi_fg": "#b54040",
-    "selected_bg": "#6a2f2f",
-    "selected_fg": "#eeeeee",
-    "inactive_fg": "#404040",
-    "graph_text": "#606060",
-    "meter_bg": "#404040",
-    "proc_misc": "#0de756",
-    "cpu_box": "#3d7b46",
-    "mem_box": "#8a882e",
-    "net_box": "#423ba5",
-    "proc_box": "#923535",
-    "div_line": "#303030",
-    "temp_start": "#4897d4",
-    "temp_mid": "#5474e8",
-    "temp_end": "#ff40b6",
-    "cpu_start": "#50f095",
-    "cpu_mid": "#f2e266",
-    "cpu_end": "#fa1e1e",
-    "download_start": "#291f75",
-    "download_mid": "#4f43a3",
-    "download_end": "#b0a9de",
-    "upload_start": "#620665",
-    "upload_mid": "#7d4180",
-    "upload_end": "#dcafde",
-    "process_start": "#80d0a3",
-    "process_mid": "#dcd179",
-    "process_end": "#d45454",
-}
+BUILTIN_ORDER = ("default", "dracula", "gruvbox", "nord")
 
-BUILTIN_THEMES: dict[str, dict[str, str]] = {
-    "default": DEFAULT_COLORS,
-    "dracula": {
-        "main_bg": "#282a36",
-        "main_fg": "#f8f8f2",
-        "title": "#f8f8f2",
-        "hi_fg": "#ff79c6",
-        "selected_bg": "#44475a",
-        "selected_fg": "#f8f8f2",
-        "inactive_fg": "#6272a4",
-        "graph_text": "#6272a4",
-        "meter_bg": "#44475a",
-        "proc_misc": "#bd93f9",
-        "cpu_box": "#bd93f9",
-        "mem_box": "#50fa7b",
-        "net_box": "#ff5555",
-        "proc_box": "#8be9fd",
-        "div_line": "#44475a",
-        "temp_start": "#8be9fd",
-        "temp_mid": "#bd93f9",
-        "temp_end": "#ff79c6",
-        "cpu_start": "#50fa7b",
-        "cpu_mid": "#f1fa8c",
-        "cpu_end": "#ff5555",
-        "download_start": "#6272a4",
-        "download_mid": "#bd93f9",
-        "download_end": "#d6acff",
-        "upload_start": "#6272a4",
-        "upload_mid": "#ff79c6",
-        "upload_end": "#ff92df",
-        "process_start": "#50fa7b",
-        "process_mid": "#f1fa8c",
-        "process_end": "#ff5555",
-    },
-    "gruvbox": {
-        "main_bg": "#282828",
-        "main_fg": "#ebdbb2",
-        "title": "#fbf1c7",
-        "hi_fg": "#fe8019",
-        "selected_bg": "#504945",
-        "selected_fg": "#fbf1c7",
-        "inactive_fg": "#665c54",
-        "graph_text": "#a89984",
-        "meter_bg": "#3c3836",
-        "proc_misc": "#8ec07c",
-        "cpu_box": "#98971a",
-        "mem_box": "#d79921",
-        "net_box": "#458588",
-        "proc_box": "#cc241d",
-        "div_line": "#504945",
-        "temp_start": "#83a598",
-        "temp_mid": "#d3869b",
-        "temp_end": "#fb4934",
-        "cpu_start": "#b8bb26",
-        "cpu_mid": "#fabd2f",
-        "cpu_end": "#fb4934",
-        "download_start": "#458588",
-        "download_mid": "#83a598",
-        "download_end": "#8ec07c",
-        "upload_start": "#b16286",
-        "upload_mid": "#d3869b",
-        "upload_end": "#fe8019",
-        "process_start": "#8ec07c",
-        "process_mid": "#fabd2f",
-        "process_end": "#fb4934",
-    },
-    "nord": {
-        "main_bg": "#2e3440",
-        "main_fg": "#d8dee9",
-        "title": "#eceff4",
-        "hi_fg": "#88c0d0",
-        "selected_bg": "#434c5e",
-        "selected_fg": "#eceff4",
-        "inactive_fg": "#4c566a",
-        "graph_text": "#7b88a1",
-        "meter_bg": "#3b4252",
-        "proc_misc": "#8fbcbb",
-        "cpu_box": "#5e81ac",
-        "mem_box": "#81a1c1",
-        "net_box": "#88c0d0",
-        "proc_box": "#81a1c1",
-        "div_line": "#4c566a",
-        "temp_start": "#5e81ac",
-        "temp_mid": "#b48ead",
-        "temp_end": "#bf616a",
-        "cpu_start": "#a3be8c",
-        "cpu_mid": "#ebcb8b",
-        "cpu_end": "#bf616a",
-        "download_start": "#5e81ac",
-        "download_mid": "#81a1c1",
-        "download_end": "#88c0d0",
-        "upload_start": "#b48ead",
-        "upload_mid": "#d08770",
-        "upload_end": "#ebcb8b",
-        "process_start": "#a3be8c",
-        "process_mid": "#ebcb8b",
-        "process_end": "#bf616a",
-    },
-}
+# Temperatures are coloured 0 °C .. TEMP_MAX along the temp gradient (btop
+# maps 0..100 % of the throttle temperature the same way).
+TEMP_MAX = 90.0
 
 _THEME_LINE = re.compile(r'^\s*theme\[(\w+)\]\s*=\s*(?:"([^"]*)"|([^\s"]+))')
 
@@ -213,6 +92,30 @@ def parse_color(value: str) -> str | None:
     raise ThemeError(f"invalid colour {value!r}")
 
 
+def parse_btop_colors(text: str, name: str = "theme") -> dict[str, str]:
+    colors: dict[str, str] = {}
+    for line in text.splitlines():
+        m = _THEME_LINE.match(line)
+        if m:
+            raw = m.group(2) if m.group(2) is not None else m.group(3)
+            color = parse_color(raw)
+            if color:
+                colors[m.group(1)] = color
+    if not colors:
+        raise ThemeError(f"{name}: no theme[...] entries found")
+    return colors
+
+
+def _builtin_text(name: str) -> str:
+    return resources.files("gputop").joinpath("theme_files", f"{name}.theme").read_text(encoding="utf-8")
+
+
+DEFAULT_COLORS: dict[str, str] = parse_btop_colors(_builtin_text("default"), "default")
+BUILTIN_THEMES: dict[str, dict[str, str]] = {
+    name: parse_btop_colors(_builtin_text(name), name) for name in BUILTIN_ORDER
+}
+
+
 def _hex_to_rgb(color: str) -> tuple[int, int, int]:
     return int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
 
@@ -226,7 +129,7 @@ def _lerp(a: str, b: str, t: float) -> str:
 
 
 def build_gradient(start: str, mid: str | None, end: str, steps: int = 101) -> list[str]:
-    """``steps`` colours from start -> (mid) -> end, like btop's gradients."""
+    """``steps`` colours: linear RGB start -> mid (0-50 %), mid -> end (50-100 %)."""
     out = []
     for i in range(steps):
         t = i / (steps - 1)
@@ -239,35 +142,56 @@ def build_gradient(start: str, mid: str | None, end: str, steps: int = 101) -> l
     return out
 
 
+def blend(a: str, b: str, t: float) -> str:
+    """Mix colour ``a`` towards ``b`` by ``t`` (0..1)."""
+    return _lerp(a, b, max(0.0, min(1.0, t)))
+
+
 @dataclass
 class Theme:
     name: str
     colors: dict[str, str] = field(default_factory=dict)
     source: str = "builtin"
+    background: bool = True  # False: leave the terminal's own background
 
     def __post_init__(self) -> None:
         merged = dict(DEFAULT_COLORS)
         merged.update({k: v for k, v in self.colors.items() if v})
         self.colors = merged
 
+    def with_background(self, background: bool) -> Theme:
+        if background == self.background:
+            return self
+        return Theme(self.name, dict(self.colors), self.source, background)
+
     def __getitem__(self, key: str) -> str:
         return self.colors.get(key) or DEFAULT_COLORS.get(key, "#cccccc")
 
     @cached_property
+    def bg(self) -> Color:
+        """Background for every cell; the terminal default when disabled."""
+        return Color.parse(self["main_bg"]) if self.background else Color.default()
+
+    @cached_property
     def base_style(self) -> Style:
         """Default foreground on the theme background (for unstyled cells)."""
-        return Style(color=self["main_fg"], bgcolor=self["main_bg"])
+        return Style(color=self["main_fg"], bgcolor=self.bg)
 
     def style(self, key: str, bold: bool = False) -> Style:
-        return self._style_cache(key, bold)
-
-    def _style_cache(self, key: str, bold: bool) -> Style:
         cache = self.__dict__.setdefault("_styles", {})
         k = (key, bold)
         if k not in cache:
-            # Styles carry the theme background so rendered cells never need
-            # a second pass to paint it (see widgets.common.LinesWidget).
-            cache[k] = Style(color=self[key], bgcolor=self["main_bg"], bold=bold)
+            # Styles carry the background so rendered cells never need a
+            # second pass to paint it (see widgets.common.LinesWidget).
+            cache[k] = Style(color=self[key], bgcolor=self.bg, bold=bold)
+        return cache[k]
+
+    def color_style(self, color: str, bold: bool = False) -> Style:
+        """Style for an arbitrary ``#rrggbb`` colour on the theme background."""
+        cache = self.__dict__.setdefault("_cstyles", {})
+        k = (color, bold)
+        if k not in cache:
+            cache[k] = Style(color=color, bgcolor=self.bg, bold=bold)
         return cache[k]
 
     def _gradient_keys(self, name: str) -> tuple[str, str | None, str]:
@@ -283,8 +207,7 @@ class Theme:
         out: dict[str, list[Style]] = {}
         for name in GRADIENTS:
             start, mid, end = self._gradient_keys(name)
-            bg = self["main_bg"]
-            out[name] = [Style(color=c, bgcolor=bg) for c in build_gradient(start, mid, end)]
+            out[name] = [Style(color=c, bgcolor=self.bg) for c in build_gradient(start, mid, end)]
         return out
 
     def gradient(self, name: str) -> list[Style]:
@@ -297,9 +220,12 @@ class Theme:
         idx = int(round(max(0.0, min(1.0, fraction)) * (len(steps) - 1)))
         return steps[idx]
 
+    def temp(self, celsius: float) -> Style:
+        """Temperature text colour (0 °C .. TEMP_MAX along the temp gradient)."""
+        return self.grad("temp", celsius / TEMP_MAX)
+
 
 def parse_theme_text(text: str, name: str, fmt: str) -> Theme:
-    colors: dict[str, str] = {}
     if fmt == "toml":
         try:
             data = tomllib.loads(text)
@@ -307,22 +233,14 @@ def parse_theme_text(text: str, name: str, fmt: str) -> Theme:
             raise ThemeError(f"{name}: {exc}") from exc
         name = str(data.get("name", name))
         table = data.get("colors", data)
+        colors = {}
         for key, value in table.items():
             if isinstance(value, str) and key != "name":
                 color = parse_color(value)
                 if color:
                     colors[key] = color
-    else:
-        for line in text.splitlines():
-            m = _THEME_LINE.match(line)
-            if m:
-                raw = m.group(2) if m.group(2) is not None else m.group(3)
-                color = parse_color(raw)
-                if color:
-                    colors[m.group(1)] = color
-        if not colors:
-            raise ThemeError(f"{name}: no theme[...] entries found")
-    return Theme(name=name, colors=colors)
+        return Theme(name=name, colors=colors)
+    return Theme(name=name, colors=parse_btop_colors(text, name))
 
 
 def load_theme_file(path: str | Path) -> Theme:

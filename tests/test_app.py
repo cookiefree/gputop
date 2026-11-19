@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 from fake_backend import make_fake
-from gputop.app import FilterBar, GpuTopApp, overview_layout
+from gputop.app import GpuTopApp, overview_layout
 from gputop.sampler import Sampler
 from gputop.themes import available_themes
 from gputop.widgets.gpu_panel import GpuDetail, GpuPanel
@@ -38,10 +38,9 @@ def run(app, scenario, size=(100, 30)):
 def test_overview_renders_all_gpus_and_processes():
     async def scenario(pilot, app):
         text = screen_text(app)
-        assert "gputop" in text
-        assert "GPU 0 · RTX 4090" in text and "GPU 1 · RTX 3060" in text
+        assert "┐¹gpu0┌┐RTX 4090┌" in text and "┐²gpu1┌┐RTX 3060┌" in text
         assert "util" in text and "vram" in text
-        assert "PID" in text and "COMMAND" in text
+        assert "Pid:" in text and "Command:" in text and "┐proc┌" in text
         assert any(ch in text for ch in "⣀⣄⣤⣦⣶⣷⣿")
         assert len(app.query(GpuPanel)) == 2
         assert app.table.rows, "process table should be populated"
@@ -59,7 +58,7 @@ def test_toggle_detail_view_filters_processes():
         assert len(app.query(GpuDetail)) == 1
         assert app.table.gpu_filter == 1
         assert all(p.gpu_index == 1 for p in app.table.rows)
-        assert "processes · GPU 1" in screen_text(app)
+        assert "┐gpu1 only┌" in screen_text(app)
         await pilot.press("shift+tab")  # switches the detail GPU too
         await pilot.pause(0.2)
         assert app.table.gpu_filter == 0
@@ -88,25 +87,32 @@ def test_number_keys_focus_gpus():
 def test_filter_typing_does_not_trigger_shortcuts():
     async def scenario(pilot, app):
         await pilot.press("f")
-        flt = app.query_one(FilterBar)
-        assert flt.display and flt.has_focus
+        table = app.table
+        assert table.editing and table.has_focus
+        assert "┐filter: █┌" in screen_text(app)  # typed into the title, like btop
         # 'q', 'a' and 't' are app shortcuts; while typing they must be text.
         for ch in "qat":
             await pilot.press(ch)
         assert app.is_running and not app.detail_mode
-        assert app.table.filter_text == "qat"
-        assert app.table.rows == []
+        assert table.filter_text == "qat"
+        assert table.rows == []
+        assert "┐filter: qat█┌" in screen_text(app)
         assert "no matching processes" in screen_text(app)
+        await pilot.press("backspace")
+        assert table.filter_text == "qa"
         await pilot.press("escape")  # clears and closes, does not quit
         await pilot.pause(0.1)
         assert app.is_running
-        assert app.table.filter_text == "" and not flt.display
-        assert app.table.rows
+        assert table.filter_text == "" and not table.editing and not table.has_focus
+        assert table.rows
 
         await pilot.press("f", "p", "y", "enter")
-        assert app.table.filter_text == "py"
-        assert not flt.display
-        assert all("py" in p.command.lower() or "py" in p.user for p in app.table.rows)
+        assert table.filter_text == "py" and not table.editing
+        assert "┐filter: py┌" in screen_text(app)
+        assert all("py" in p.command.lower() or "py" in p.user for p in table.rows)
+        await pilot.press("q")  # shortcuts work again after Enter
+        await pilot.pause(0.1)
+        assert not app.is_running
 
     run(make_app(count=3), scenario)
 
@@ -123,13 +129,14 @@ def test_sort_keys_and_header_click():
         assert table.sort_reverse
         assert app.changes["sort_key"] == "sm" and app.changes["sort_reverse"] is True
 
-        # Click the PID header (content row 0, first column).
-        region = table.content_region
-        await pilot.click(offset=(region.x + 1, region.y))
+        # Click the Pid: header (first row inside the border, first column).
+        region = table.region
+        header = (region.x + 2 + 3, region.y + 1)
+        await pilot.click(offset=header)
         assert table.sort_key == "pid"
         pids = [p.pid for p in table.rows]
         assert pids == sorted(pids)
-        await pilot.click(offset=(region.x + 1, region.y))  # same header: reverse
+        await pilot.click(offset=header)  # same header: reverse
         assert [p.pid for p in table.rows] == sorted(pids, reverse=True)
 
     run(make_app(count=3), scenario)
@@ -173,7 +180,7 @@ def test_interval_keys_clamp():
             await pilot.press("minus")
         assert app.sampler.interval == pytest.approx(5.0)
         assert app.changes["interval_ms"] == 5000
-        assert "5000ms" in screen_text(app)
+        assert "┐- 5000ms +┌" in screen_text(app)
 
     run(make_app(), scenario)
 
@@ -217,7 +224,7 @@ def test_gpu_lost_mid_run_does_not_crash():
         assert app.is_running
         text = screen_text(app)
         assert "GPU no longer available" in text
-        assert "LOST" in text
+        assert "┘LOST└" in text
         assert all(p.gpu_index != 0 for p in app.table.rows)
         await pilot.press("a")  # detail view of a lost GPU
         await pilot.pause(0.2)
@@ -236,23 +243,25 @@ def test_resizes_without_crashing(size):
         await pilot.press("a")
         await pilot.pause(0.2)
         assert app.is_running
-        assert "gputop" in screen_text(app) or size[0] < 50
+        text = screen_text(app)
+        assert "┐proc┌" in text or size[1] < 12
+        assert "gpu0" in text
 
     run(make_app(count=4), scenario)
 
 
 def test_overview_layout_math():
-    # 2 GPUs on 80x24: side by side, panels at least 3 rows tall
-    cols, rows, ph = overview_layout(2, 78, 22)
-    assert (cols, rows) == (2, 1) and ph >= 6
-    # many GPUs on a small terminal still leave room for the process table
-    cols, rows, ph = overview_layout(8, 78, 22)
-    assert cols == 2 and rows == 4 and ph == 4
-    assert rows * ph <= 22 - 6
-    # single GPU on a huge terminal: panel grows, capped at 12
-    assert overview_layout(1, 300, 100)[2] == 12
-    # narrow: one column
-    assert overview_layout(3, 50, 40)[0] == 1
+    # 1-2 GPUs: stacked full width, ~65 % of the height, equal box heights
+    assert overview_layout(2, 80, 24) == (1, 2, 8)  # 16 rows of GPU boxes, proc box 8
+    assert overview_layout(2, 160, 50) == (1, 2, 16)  # 32 rows (65 %), proc box 18
+    assert overview_layout(1, 120, 40) == (1, 1, 26)
+    # 3+ GPUs: two columns only from 160 columns; proc box shrinks to 8 rows
+    assert overview_layout(6, 200, 60) == (2, 3, 17)
+    assert overview_layout(6, 120, 40) == (1, 6, 5)
+    # never below a 3-row box (the GPU area scrolls instead)
+    assert overview_layout(6, 80, 24)[2] == 3
+    # no process box: the GPU boxes fill the screen
+    assert overview_layout(2, 80, 24, with_table=False) == (1, 2, 12)
 
 
 # -- Intel / mixed-vendor UI behaviour ------------------------------------------------
@@ -291,19 +300,18 @@ def test_intel_igpu_panel_hides_vram_and_shows_hint(tmp_path):
     async def scenario(pilot, app):
         text = screen_text(app)
         assert "vram" not in text  # shared memory: no fake VRAM bar
-        assert "util hidden: needs kernel.perf_event_paranoid=0" in text
+        assert "util hidden: needs" in text and "perf_event_paranoid=0" in text
         assert "temp 61°C" in text
-        # no fdinfo clients: process table hidden entirely
+        assert "clk" in text  # clock history stands in for the missing util graph
+        # no fdinfo clients: process box hidden entirely
         assert not app.table.display
-        assert "processes" not in text
+        assert "┐proc┌" not in text
         await pilot.press("a")
         await pilot.pause(0.3)
         text = screen_text(app)
-        assert "⚠ util hidden" in text
-        boxes = [b for b in app.query("MetricBox") if b.display]
-        titles = " ".join(str(b.border_title) for b in boxes)
-        assert "temp" in titles and "gfx" in titles
-        assert "vram" not in titles and "pcie" not in titles and "util" not in titles
+        assert "util hidden" in text
+        shown = {type(b).__name__ for b in app._detail.boxes if b.display}
+        assert shown == {"PowerTempBox"}  # no VRAM box, no PCIe box (no data)
         assert not app.table.display
 
     run(make_intel_app(tmp_path), scenario)
@@ -314,9 +322,9 @@ def test_intel_with_fdinfo_shows_table_without_empty_columns(tmp_path):
         assert app.table.display
         text = screen_text(app)
         assert "kitty" in text
-        header = next(line for line in text.splitlines() if "PID" in line)
-        assert "VRAM" not in header and "SM%" not in header  # all-empty columns hidden
-        assert "TYPE" in header
+        header = next(line for line in text.splitlines() if "Pid:" in line)
+        assert "Vram" not in header and "Sm%" not in header  # all-empty columns hidden
+        assert "Type:" in header
 
     run(make_intel_app(tmp_path, with_clients=True), scenario)
 

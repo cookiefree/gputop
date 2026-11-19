@@ -1,4 +1,16 @@
-"""Sortable, filterable, scrollable process list (custom-rendered, btop look)."""
+"""The process list, drawn as btop's proc box.
+
+::
+
+    ╭─┐proc┌┐filter┌─────────────────────────┐reverse┌┐sort: vram┌─╮
+    │    Pid: User:     Command:              Gpu:   Vram ↓  Sm% Type:   │
+    │   4211 nik       ollama serve              0    6.2G   81 Compute │
+    ╰┘↑ select ↓└┘detail ↵└┘theme t└┘help h└┘quit q└──────────┘1/12└╯
+
+Rows fade from main_fg towards inactive_fg further down the list (btop's
+``proc_gradient``); a scrollbar appears on the right when the list overflows.
+Filter text is typed straight into the ``┐filter: …┌`` tab, like btop.
+"""
 
 from __future__ import annotations
 
@@ -9,13 +21,14 @@ from typing import Any
 from rich.style import Style
 from rich.text import Text
 from textual import events
+from textual.binding import Binding
 from textual.message import Message
-from textual.widget import Widget
 
 from .. import fmt
 from ..backends.base import GPUProcess
-from ..themes import Theme
-from .common import LinesWidget, join_lines, reset_titles, set_border, set_title
+from ..themes import Theme, blend
+from .box import Tab, hotkey_tab
+from .gpu_panel import BoxWidget
 
 
 @dataclass(frozen=True)
@@ -34,17 +47,18 @@ def _num(v: float | None) -> float:
 
 
 COLUMNS: tuple[Column, ...] = (
-    Column("pid", "PID", 7, "left", 99, lambda p: p.pid, False),
-    Column("user", "USER", 9, "left", 2, lambda p: p.user.lower(), False),
-    Column("command", "COMMAND", 0, "left", 99, lambda p: p.command.lower(), False),
-    Column("gpu", "GPU", 3, "right", 3, lambda p: p.gpu_index, False),
-    Column("vram", "VRAM", 8, "right", 99, lambda p: _num(p.vram_used), True),
-    Column("sm", "SM%", 4, "right", 4, lambda p: _num(p.sm_util), True),
-    Column("type", "TYPE", 8, "left", 1, lambda p: p.type, False),
+    Column("pid", "Pid:", 7, "right", 99, lambda p: p.pid, False),
+    Column("user", "User:", 9, "left", 2, lambda p: p.user.lower(), False),
+    Column("command", "Command:", 0, "left", 99, lambda p: p.command.lower(), False),
+    Column("gpu", "Gpu:", 4, "right", 3, lambda p: p.gpu_index, False),
+    Column("vram", "Vram", 8, "right", 99, lambda p: _num(p.vram_used), True),
+    Column("sm", "Sm%", 5, "right", 4, lambda p: _num(p.sm_util), True),
+    Column("type", "Type:", 8, "left", 1, lambda p: p.type, False),
 )
 SORT_KEYS: tuple[str, ...] = tuple(c.key for c in COLUMNS)
 _BY_KEY = {c.key: c for c in COLUMNS}
 MIN_COMMAND_W = 12
+FADE = 0.95  # how far the last visible row fades towards inactive_fg
 
 
 def sort_processes(procs: list[GPUProcess], key: str, reverse: bool) -> list[GPUProcess]:
@@ -86,17 +100,19 @@ def layout_columns(width: int, hide: set[str] | None = None) -> list[tuple[Colum
     return [(c, c.width or flex) for c in cols]
 
 
-class ProcessTable(LinesWidget, can_focus=False):
-    DEFAULT_CSS = """
-    ProcessTable {
-        border: round white;
-        border-title-align: left;
-        border-subtitle-align: right;
-        padding: 0 1;
-        height: 1fr;
-        min-height: 4;
-    }
-    """
+def _hint(label: str, key: str) -> Tab:
+    text = f"{label} {key}"
+    return Tab(text, hotkey=len(text) - 1, bold=False)
+
+
+class ProcessTable(BoxWidget):
+    color_key = "proc_box"
+
+    BINDINGS = [
+        Binding("escape", "filter_cancel", show=False),
+        Binding("enter", "filter_accept", show=False),
+        Binding("backspace", "filter_backspace", show=False),
+    ]
 
     class SortChanged(Message):
         def __init__(self, key: str, reverse: bool) -> None:
@@ -105,11 +121,12 @@ class ProcessTable(LinesWidget, can_focus=False):
             self.reverse = reverse
 
     def __init__(self, theme: Theme, sort_key: str = "vram", sort_reverse: bool = False, **kwargs) -> None:
-        super().__init__(**kwargs)
-        self.gputop_theme = theme
+        super().__init__(theme, **kwargs)
+        self.can_focus = False  # only focusable while the filter is being typed
         self.sort_key = sort_key if sort_key in SORT_KEYS else "vram"
         self.sort_reverse = sort_reverse
         self.filter_text = ""
+        self.editing = False
         self.gpu_filter: int | None = None
         self.show_gpu_column = True
         self._all: list[GPUProcess] = []
@@ -117,6 +134,8 @@ class ProcessTable(LinesWidget, can_focus=False):
         self.selected_pid: int | None = None
         self.scroll_top = 0
         self._layout: list[tuple[Column, int]] = []
+        self._digest: tuple | None = None
+        self.mem_totals: dict[int, int] = {}  # gpu index -> VRAM bytes (colours VRAM by share)
 
     # -- data -----------------------------------------------------------------
 
@@ -124,21 +143,20 @@ class ProcessTable(LinesWidget, can_focus=False):
         self._all = list(procs)
         self._rebuild()
 
-    def _rebuild(self) -> None:
+    def _rebuild(self, force: bool = False) -> None:
         rows = filter_processes(self._all, self.filter_text, self.gpu_filter)
         self.rows = sort_processes(rows, self.sort_key, self.sort_reverse)
         if self.selected_pid is not None and self.selected_index is None:
             self.selected_pid = None  # selected process exited or was filtered
         self._clamp_scroll()
-        self.update_chrome()
         # Repaint only if something visible changed (saves CPU when idle).
         digest = (
-            self.sort_key, self.sort_reverse, self.filter_text, self.gpu_filter,
-            self.selected_pid, self.scroll_top,
+            self.sort_key, self.sort_reverse, self.filter_text, self.editing, self.gpu_filter,
+            self.selected_pid, self.scroll_top, len(self.rows),
             tuple((p.pid, p.user, p.command, p.gpu_index, p.vram_used, p.sm_util, p.type)
                   for p in self.rows[self.scroll_top: self.scroll_top + max(1, self.visible_rows)]),
         )
-        if digest != getattr(self, "_digest", None):
+        if force or digest != self._digest:
             self._digest = digest
             self.refresh()
 
@@ -153,7 +171,7 @@ class ProcessTable(LinesWidget, can_focus=False):
 
     @property
     def visible_rows(self) -> int:
-        return max(0, self.content_size.height - 1)
+        return max(0, self.size.height - 3)  # two borders + header
 
     def _clamp_scroll(self) -> None:
         vis = max(1, self.visible_rows)
@@ -174,14 +192,14 @@ class ProcessTable(LinesWidget, can_focus=False):
     def set_gpu_filter(self, gpu: int | None) -> None:
         self.gpu_filter = gpu
         self.show_gpu_column = gpu is None
-        self._rebuild()
+        self._rebuild(force=True)
 
     def set_sort(self, key: str, reverse: bool | None = None) -> None:
         if key in SORT_KEYS:
             self.sort_key = key
         if reverse is not None:
             self.sort_reverse = reverse
-        self._rebuild()
+        self._rebuild(force=True)
         self.post_message(self.SortChanged(self.sort_key, self.sort_reverse))
 
     def cycle_sort(self) -> None:
@@ -201,16 +219,12 @@ class ProcessTable(LinesWidget, can_focus=False):
         else:
             idx = max(0, min(len(self.rows) - 1, idx + delta))
         self.selected_pid = self.rows[idx].pid
-        self._clamp_scroll()
-        self.update_chrome()
-        self.refresh()
+        self._rebuild(force=True)
 
     def select_edge(self, end: bool) -> None:
         if self.rows:
             self.selected_pid = self.rows[-1 if end else 0].pid
-            self._clamp_scroll()
-            self.update_chrome()
-            self.refresh()
+            self._rebuild(force=True)
 
     def page(self, direction: int) -> None:
         self.move_selection(direction * max(1, self.visible_rows - 1))
@@ -219,49 +233,71 @@ class ProcessTable(LinesWidget, can_focus=False):
         if self.selected_pid is None:
             return False
         self.selected_pid = None
-        self.refresh()
+        self._rebuild(force=True)
         return True
 
-    # -- theme / chrome -------------------------------------------------------
+    # -- inline filter editing (btop types the filter into the title) ----------
 
-    def apply_theme(self, theme: Theme) -> None:
-        self.gputop_theme = theme
-        reset_titles(self)
-        self.update_chrome()
-        self.refresh()
+    def start_edit(self) -> None:
+        self.editing = True
+        self.can_focus = True
+        self.focus()
+        self._rebuild(force=True)
 
-    def update_chrome(self) -> None:
-        th = self.gputop_theme
-        set_border(self, th["proc_box"])
-        title = Text()
-        title.append("processes", th.style("title", bold=True))
-        if self.gpu_filter is not None:
-            title.append(f" · GPU {self.gpu_filter}", th.style("hi_fg"))
-        set_title(self, "border_title", title)
+    def _stop_edit(self) -> None:
+        self.editing = False
+        self.can_focus = False
+        self.app.set_focus(None)
+        self._rebuild(force=True)
 
-        sub = Text()
-        vis = self.visible_rows
-        if vis and len(self.rows) > vis:
-            end = min(len(self.rows), self.scroll_top + vis)
-            sub.append(f"{self.scroll_top + 1}-{end}", th.style("title"))
-            sub.append(f"/{len(self.rows)}", th.style("main_fg"))
+    def check_consume_key(self, key: str, character: str | None) -> bool:
+        return self.editing and character is not None and character.isprintable()
+
+    def on_key(self, event: events.Key) -> None:
+        if self.editing and event.is_printable and event.character:
+            event.stop()
+            event.prevent_default()
+            self.set_filter(self.filter_text + event.character)
+
+    def action_filter_backspace(self) -> None:
+        if self.editing:
+            self.set_filter(self.filter_text[:-1])
+
+    def action_filter_accept(self) -> None:
+        self._stop_edit()
+
+    def action_filter_cancel(self) -> None:
+        self.filter_text = ""
+        self._stop_edit()
+
+    # -- chrome ---------------------------------------------------------------
+
+    def top_tabs(self):
+        left = [Tab("proc")]
+        if self.editing:
+            left.append(Tab(f"filter: {self.filter_text}█", hotkey=0, bold=False))
+        elif self.filter_text:
+            left.append(Tab(f"filter: {self.filter_text}", hotkey=0, bold=False))
         else:
-            sub.append(f"{len(self.rows)}", th.style("title"))
-            sub.append(" procs", th.style("main_fg"))
-        if self.filter_text:
-            total = len(filter_processes(self._all, "", self.gpu_filter))
-            sub.append(" · filter ", th.style("main_fg"))
-            sub.append(self.filter_text, th.style("hi_fg", bold=True))
-            sub.append(f" ({len(self.rows)}/{total})", th.style("graph_text"))
-        set_title(self, "border_subtitle", sub)
+            left.append(hotkey_tab("filter", bold=False))
+        right = []
+        if self.gpu_filter is not None:
+            right.append(Tab(f"gpu{self.gpu_filter} only", bold=False))
+        right.append(hotkey_tab("reverse", bold=False))
+        right.append(hotkey_tab(f"sort: {self.sort_key}", "s"))
+        return left, None, right
+
+    def bottom_tabs(self):
+        select = Tab("↑ select ↓", marks={0: "hi_fg", 9: "hi_fg"}, bold=False)
+        left = [select, _hint("detail", "↵"), _hint("theme", "t"), _hint("help", "h"), _hint("quit", "q")]
+        idx = self.selected_index
+        right = [Tab(f"{0 if idx is None else idx + 1}/{len(self.rows)}")]
+        return left, right
 
     # -- rendering ------------------------------------------------------------
 
-    def render_text(self) -> Text:
-        w, h = self.content_size
+    def content(self, w: int, h: int) -> list[Text]:
         th = self.gputop_theme
-        if w <= 0 or h <= 0:
-            return Text("")
         hide = set() if self.show_gpu_column else {"gpu"}
         # Columns no listed process has data for (e.g. VRAM and SM% for Intel
         # iGPU clients) are hidden instead of filled with dashes.
@@ -269,63 +305,93 @@ class ProcessTable(LinesWidget, can_focus=False):
             hide.add("vram")
         if self.rows and all(p.sm_util is None for p in self.rows):
             hide.add("sm")
-        self._layout = layout_columns(w, hide)
+        vis = max(0, h - 1)
+        overflow = len(self.rows) > vis
+        table_w = w - 2 if overflow else w  # reserve a gap + the scrollbar column
+        self._layout = layout_columns(table_w, hide)
         lines = [self._header(th)]
         if not self.rows:
             msg = "no matching processes" if self.filter_text else "no GPU processes"
             lines.append(Text(msg, th.style("inactive_fg")))
-            return join_lines(lines, w)
+            return lines
 
         sel = self.selected_pid
         sel_style = Style(bgcolor=th["selected_bg"], color=th["selected_fg"], bold=True)
-        for p in self.rows[self.scroll_top: self.scroll_top + h - 1]:
-            lines.append(self._row(p, th, w, sel_style if p.pid == sel else None))
-        return join_lines(lines, w)
+        window = self.rows[self.scroll_top: self.scroll_top + vis]
+        for i, p in enumerate(window):
+            fade = FADE * i / max(1, vis - 1)
+            lines.append(self._row(p, th, table_w, sel_style if p.pid == sel else None, fade))
+        if overflow:
+            bar = self._scrollbar(vis)
+            lines[0].append(" " * (table_w - lines[0].cell_len + 2), th.base_style)
+            for i in range(1, len(lines)):
+                lines[i].append(" ", th.base_style)
+                lines[i].append(bar[i - 1], th.style("main_fg", bold=True))
+        return lines
+
+    def _scrollbar(self, vis: int) -> list[str]:
+        """btop-style: ↑ at the top, ↓ at the bottom, █ marking the position."""
+        bar = [" "] * vis
+        if vis >= 1:
+            span = max(1, len(self.rows) - vis)
+            pos = 1 + round((vis - 3) * self.scroll_top / span) if vis > 2 else 0
+            bar[max(0, min(vis - 1, pos))] = "█"
+            bar[0] = "↑"
+            bar[-1] = "↓"
+        return bar
 
     def _header(self, th: Theme) -> Text:
-        line = Text(no_wrap=True, overflow="crop")
-        for i, (col, width) in enumerate(self._layout):
-            if i:
-                line.append(" ")
-            label = col.header
-            style = th.style("title", bold=True)
-            if col.key == self.sort_key:
-                desc = col.natural_desc != self.sort_reverse
-                label = label + ("▼" if desc else "▲")
-                style = th.style("hi_fg", bold=True)
-            cell = label.rjust(width) if col.align == "right" else label.ljust(width)
-            line.append(cell[:width], style)
-        return line
-
-    def _row(self, p: GPUProcess, th: Theme, width: int, sel: Style | None) -> Text:
-        line = Text(no_wrap=True, overflow="crop")
+        line = Text(no_wrap=True)
+        title = th.style("title", bold=True)
+        arrow_style = th.style("main_fg", bold=True)  # btop: header title, arrow main_fg
         for i, (col, w) in enumerate(self._layout):
             if i:
-                line.append(" ")
-            style = th.style("main_fg")
+                line.append(" ", th.base_style)
+            label = col.header
+            arrow = ""
+            if col.key == self.sort_key:
+                arrow = "↓" if col.natural_desc != self.sort_reverse else "↑"
+                label = f"{col.header} {arrow}"
+                if len(label) > w:
+                    label = col.header.rstrip(":") + arrow
+            label = label[:w]
+            cell = label.rjust(w) if col.align == "right" else label.ljust(w)
+            for ch in cell:
+                line.append(ch, arrow_style if arrow and ch == arrow else title)
+        return line
+
+    def _row(self, p: GPUProcess, th: Theme, width: int, sel: Style | None, fade: float) -> Text:
+        line = Text(no_wrap=True)
+        faded = th.color_style(blend(th["main_fg"], th["inactive_fg"], fade))
+        for i, (col, w) in enumerate(self._layout):
+            if i:
+                line.append(" ", th.base_style)
+            style = faded
             if col.key == "pid":
                 val = str(p.pid)
             elif col.key == "user":
                 val = p.user or "?"
             elif col.key == "command":
                 val = p.command or p.name_hint or f"[{p.pid}]"
-                style = th.style("title")
             elif col.key == "gpu":
                 val = str(p.gpu_index)
             elif col.key == "vram":
                 val = fmt.bytes_short(p.vram_used) if p.vram_used is not None else "-"
+                if p.vram_used is not None:
+                    total = self.mem_totals.get(p.gpu_index) or 8 * 1024**3
+                    style = th.grad("proc", min(1.0, p.vram_used / total))
             elif col.key == "sm":
                 val = "-" if p.sm_util is None else f"{p.sm_util:.0f}"
                 if p.sm_util is not None:
                     style = th.grad("proc", p.sm_util / 100)
             else:  # type
                 val = p.type
-                style = th.style("proc_misc" if p.type != "Graphics" else "graph_text")
+                if p.type != "Graphics":
+                    style = th.style("proc_misc")
             val = fmt.truncate(val, w)
-            cell = val.rjust(w) if col.align == "right" else val.ljust(w)
-            line.append(cell, style)
+            line.append(val.rjust(w) if col.align == "right" else val.ljust(w), style)
         if sel is not None:
-            line.pad_right(max(0, width - len(line.plain)))
+            line.pad_right(max(0, width - line.cell_len))
             line.stylize(sel)
         return line
 
@@ -345,8 +411,9 @@ class ProcessTable(LinesWidget, can_focus=False):
         if offset is None:
             return
         event.stop()
-        if offset.y == 0:
-            key = self.column_at(offset.x)
+        x, y = offset.x - 1 - self.pad, offset.y - 1  # inside the border and padding
+        if y == 0:
+            key = self.column_at(x)
             if key is None:
                 return
             if key == self.sort_key:
@@ -354,10 +421,10 @@ class ProcessTable(LinesWidget, can_focus=False):
             else:
                 self.set_sort(key, False)
             return
-        idx = self.scroll_top + offset.y - 1
-        if 0 <= idx < len(self.rows):
+        idx = self.scroll_top + y - 1
+        if y >= 1 and 0 <= idx < len(self.rows):
             self.selected_pid = self.rows[idx].pid
-            self.refresh()
+            self._rebuild(force=True)
 
     def on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
         event.stop()
@@ -369,7 +436,4 @@ class ProcessTable(LinesWidget, can_focus=False):
 
     def on_resize(self, event: events.Resize) -> None:
         self._clamp_scroll()
-        self.update_chrome()
-
-    def on_mount(self) -> None:
-        self.update_chrome()
+        self._rebuild(force=True)
