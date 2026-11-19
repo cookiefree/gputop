@@ -61,3 +61,19 @@ def test_layout_drops_columns_when_narrow():
 
 def test_layout_hides_gpu_column_on_request():
     assert "gpu" not in [c.key for c, _ in layout_columns(120, {"gpu"})]
+
+
+def test_vram_sort_falls_back_when_no_process_has_vram():
+    from gputop.themes import Theme
+    from gputop.widgets.process_table import ProcessTable
+
+    no_vram = [GPUProcess(pid=p, gpu_index=0, user="u", command="c") for p in (30, 10, 20)]
+    t = ProcessTable(Theme("default"), sort_key="vram")
+    t.set_processes(no_vram)
+    assert t.effective_sort_key == "pid"
+    assert pids(t.rows) == [10, 20, 30]
+    engines = [GPUProcess(pid=p, gpu_index=0, sm_util=sm, user="u", command="c") for p, sm in ((1, 5.0), (2, 50.0))]
+    t.set_processes(engines)
+    assert t.effective_sort_key == "sm" and pids(t.rows) == [2, 1]  # engine use when fdinfo has it
+    t.set_processes(PROCS)  # VRAM data present again: the chosen sort applies
+    assert t.effective_sort_key == "vram" and t.sort_key == "vram"

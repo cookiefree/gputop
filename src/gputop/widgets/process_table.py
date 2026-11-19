@@ -143,9 +143,23 @@ class ProcessTable(BoxWidget):
         self._all = list(procs)
         self._rebuild()
 
+    @property
+    def effective_sort_key(self) -> str:
+        """The sort actually applied. A VRAM sort is meaningless when no listed
+        process has VRAM data (e.g. Intel iGPU clients): then sort by engine use
+        (SM%) if fdinfo provides it, else by PID. The chosen key is kept, so it
+        applies again on GPUs that do report VRAM."""
+        key = self.sort_key
+        visible = filter_processes(self._all, self.filter_text, self.gpu_filter)
+        if key == "vram" and visible and all(p.vram_used is None for p in visible):
+            key = "sm" if any(p.sm_util is not None for p in visible) else "pid"
+        if key == "sm" and visible and all(p.sm_util is None for p in visible):
+            key = "pid"
+        return key
+
     def _rebuild(self, force: bool = False) -> None:
         rows = filter_processes(self._all, self.filter_text, self.gpu_filter)
-        self.rows = sort_processes(rows, self.sort_key, self.sort_reverse)
+        self.rows = sort_processes(rows, self.effective_sort_key, self.sort_reverse)
         if self.selected_pid is not None and self.selected_index is None:
             self.selected_pid = None  # selected process exited or was filtered
         self._clamp_scroll()
@@ -203,7 +217,7 @@ class ProcessTable(BoxWidget):
         self.post_message(self.SortChanged(self.sort_key, self.sort_reverse))
 
     def cycle_sort(self) -> None:
-        i = SORT_KEYS.index(self.sort_key)
+        i = SORT_KEYS.index(self.effective_sort_key)
         self.set_sort(SORT_KEYS[(i + 1) % len(SORT_KEYS)])
 
     def toggle_reverse(self) -> None:
@@ -284,7 +298,7 @@ class ProcessTable(BoxWidget):
         if self.gpu_filter is not None:
             right.append(Tab(f"gpu{self.gpu_filter} only", bold=False))
         right.append(hotkey_tab("reverse", bold=False))
-        right.append(hotkey_tab(f"sort: {self.sort_key}", "s"))
+        right.append(hotkey_tab(f"sort: {self.effective_sort_key}", "s"))
         return left, None, right
 
     def bottom_tabs(self):
@@ -344,12 +358,13 @@ class ProcessTable(BoxWidget):
         line = Text(no_wrap=True)
         title = th.style("title", bold=True)
         arrow_style = th.style("main_fg", bold=True)  # btop: header title, arrow main_fg
+        sort_key = self.effective_sort_key
         for i, (col, w) in enumerate(self._layout):
             if i:
                 line.append(" ", th.base_style)
             label = col.header
             arrow = ""
-            if col.key == self.sort_key:
+            if col.key == sort_key:
                 arrow = "↓" if col.natural_desc != self.sort_reverse else "↑"
                 label = f"{col.header} {arrow}"
                 if len(label) > w:
@@ -416,7 +431,7 @@ class ProcessTable(BoxWidget):
             key = self.column_at(x)
             if key is None:
                 return
-            if key == self.sort_key:
+            if key == self.effective_sort_key:
                 self.toggle_reverse()
             else:
                 self.set_sort(key, False)

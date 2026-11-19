@@ -72,7 +72,7 @@ With `--backend fake --fake-gpus 2` (synthetic data, no GPU needed):
 
 Requires Python 3.11+ and Linux. For NVIDIA GPUs you need the proprietary
 NVIDIA driver (which provides `libnvidia-ml.so`); Intel GPUs need nothing extra
-(see [Intel GPUs](#intel-gpus) for optional permissions).
+(see [Intel notes](#intel-notes) for optional permissions).
 
 ```sh
 pipx install .            # from a checkout of this repository
@@ -155,35 +155,42 @@ go to sleep the backend is shut down so it doesn't hold them open. Note that
 polling an *active* GPU every refresh keeps it busy enough that it may not
 autosuspend while gputop runs; slow the refresh with `-` if that matters.
 
-### Intel GPUs
+### Intel notes
 
 `--backend intel` (or `auto`) reads integrated and discrete Intel GPUs (i915,
-partial xe) **read-only**, without root:
+partial xe) **read-only and without root**:
 
 | Metric | Source | If unavailable |
 | --- | --- | --- |
+| utilisation | exact: i915 perf PMU `*-busy` counters (as `intel_gpu_top`), with a per-engine breakdown; otherwise **estimated** from RC6 residency | hidden |
 | frequency | `gt_act_freq_mhz` (actual), `gt_cur_freq_mhz`, `gt_max_freq_mhz` | hidden |
-| utilisation, per-engine busy | i915 perf PMU `*-busy` counters (as `intel_gpu_top`) | hidden, with a one-line hint |
 | power | RAPL GPU domain (`uncore`), else CPU package (labelled); hwmon energy on discrete cards | hidden |
 | temperature | coretemp "Package id 0" (iGPU), card hwmon (discrete) | hidden |
-| processes | `/proc/PID/fdinfo` `drm-*` keys (kernel ≥ 5.19) | process table hidden for that GPU |
+| processes | `/proc/PID/fdinfo` `drm-*` keys (kernel ≥ 5.19) | process box hidden for that GPU |
 
-Integrated GPUs share system memory, so there is **no VRAM bar** for them.
-
-Most distros restrict both counters by default:
-
-- **Utilisation** needs system-wide perf access. Either allow it for everyone
-  (`sudo sysctl kernel.perf_event_paranoid=0`, persist in `/etc/sysctl.d/`) or
-  give only the Python interpreter that runs gputop the capability
-  (`sudo setcap cap_perfmon=ep "$(readlink -f "$(which python3)")"`; note this
-  applies to every script run with that interpreter, so prefer a dedicated venv).
-- **Power** via RAPL is root-only since 2020 (`energy_uj` is mode 0400). gputop
-  simply hides it; you can `chmod a+r` the `intel-rapl` `energy_uj` files at
-  boot (e.g. a udev rule) if you accept the side-channel risk.
-
-Per-process engine busy % needs Gen8+ GPUs (older ones list clients without
-SM%), and only your own processes' fdinfo is readable without root. DRM
-clients are rediscovered every 5 seconds.
+- **Utilisation works out of the box, as an estimate.** Without perf access,
+  gputop reads the world-readable RC6 residency counter
+  (`card*/power/rc6_residency_ms`) and shows `util = 100 − time in RC6`
+  over each refresh. It's labelled `util~`, has no per-engine breakdown, and
+  the box's bottom border says "util is estimated (RC6); perf_event_paranoid=0
+  for exact". RC6 is the GPU's idle power state, so this measures "how often
+  the GPU was awake", which tracks load well but isn't the same as engine
+  busy time.
+- **Exact numbers** need system-wide perf access. Either allow it for everyone
+  (`sudo sysctl kernel.perf_event_paranoid=0`, persist it in `/etc/sysctl.d/`)
+  or grant the capability only to the interpreter that runs gputop
+  (`sudo setcap cap_perfmon=ep "$(readlink -f "$(which python3)")"`; prefer a
+  dedicated venv, since every script run with that interpreter gets it).
+  gputop then switches to the PMU counters automatically.
+- **Power** comes from RAPL, whose `energy_uj` files are root-only on most
+  distros since 2020. gputop never asks for root and simply hides power. You
+  can `chmod a+r` the `intel-rapl` `energy_uj` files at boot (e.g. a udev rule)
+  if you accept the side-channel risk that made them root-only.
+- Integrated GPUs share system memory, so there is **no VRAM bar**, and the
+  process list sorts by engine use (or PID) instead of VRAM.
+- Per-process engine busy % needs Gen8+ GPUs (older ones list clients without
+  it), and only your own processes' fdinfo is readable without root. DRM
+  clients are rediscovered every 5 seconds.
 
 ### Keys
 
@@ -222,11 +229,12 @@ color = "auto"         # auto, truecolor, 256, 16
 
 Settings you change *inside the app* (theme, interval, sort, view) are saved on
 exit. Command-line flags only apply to that run. Two btop options are
-supported with btop's defaults:
+supported:
 
 ```toml
-rounded_corners = true    # false: square corners ┌ ┐ └ ┘
-theme_background = true   # false: keep the terminal's own background
+rounded_corners = true     # btop's default; false: square corners ┌ ┐ └ ┘
+theme_background = false   # default: your terminal's own background;
+                           # true: paint the theme's main_bg (btop's default)
 ```
 
 ### Themes

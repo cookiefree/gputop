@@ -443,3 +443,104 @@ def test_backend_never_writes_to_the_tree(tree):
         b.get_processes(dev)
     b.shutdown()
     assert snapshot() == before
+
+
+# -- RC6 utilisation estimate (no perf access needed) -----------------------------------
+
+
+def rc6_tree(tree, pmu_error=errno.EACCES, where="power"):
+    from fake_sysfs import set_rc6
+
+    igpu(tree).add_pmu()
+    tree.pmu_error = pmu_error
+    set_rc6(tree, 1, 10_000, where)
+    return lambda ms: set_rc6(tree, 1, ms, where)
+
+
+def test_rc6_estimate_when_pmu_not_permitted(tree):
+    set_rc6 = rc6_tree(tree)
+    b = make(tree)
+    (dev,) = b.get_devices()  # primes the RC6 baseline
+    tree.clock.advance(1.0)
+    set_rc6(10_000 + 250)  # 250 ms of 1000 ms idle in RC6 -> 75 % busy
+    s = b.sample(dev)
+    assert s.util_gpu == 75.0 and s.util_estimated
+    assert s.engine_util is None  # no per-engine breakdown for an estimate
+    assert s.notes == ("util is estimated (RC6); perf_event_paranoid=0 for exact",)
+    tree.clock.advance(0.5)
+    set_rc6(10_250 + 500)  # fully idle for the last 0.5 s
+    assert b.sample(dev).util_gpu == 0.0
+
+
+def test_rc6_estimate_from_gt_directory(tree):
+    set_rc6 = rc6_tree(tree, where="gt")
+    b = make(tree)
+    (dev,) = b.get_devices()
+    tree.clock.advance(2.0)
+    set_rc6(10_000 + 1_000)
+    assert b.sample(dev).util_gpu == 50.0
+
+
+def test_rc6_counter_reset_starts_a_new_baseline(tree):
+    set_rc6 = rc6_tree(tree)
+    b = make(tree)
+    (dev,) = b.get_devices()
+    tree.clock.advance(1.0)
+    set_rc6(5)  # went backwards: wrapped / reset (e.g. after suspend)
+    s = b.sample(dev)
+    assert s.util_gpu is None and s.util_estimated  # no bogus value for this interval
+    tree.clock.advance(1.0)
+    set_rc6(5 + 900)
+    assert b.sample(dev).util_gpu == 10.0  # resumes from the new baseline
+
+
+def test_rc6_clamped_to_0_100(tree):
+    set_rc6 = rc6_tree(tree)
+    b = make(tree)
+    (dev,) = b.get_devices()
+    tree.clock.advance(1.0)
+    set_rc6(10_000 + 1_300)  # more residency than wall time (timer skew)
+    assert b.sample(dev).util_gpu == 0.0
+
+
+def test_rc6_missing_keeps_util_hidden_with_hint(tree):
+    igpu(tree).add_pmu()
+    tree.pmu_error = errno.EACCES  # and no rc6_residency_ms file at all
+    b = make(tree)
+    (dev,) = b.get_devices()
+    tree.clock.advance(1.0)
+    s = b.sample(dev)
+    assert s.util_gpu is None and not s.util_estimated
+    assert "perf_event_paranoid=0" in s.notes[0] and "CAP_PERFMON" in s.notes[0]
+
+
+def test_exact_pmu_counters_win_over_rc6(tree):
+    set_rc6 = rc6_tree(tree, pmu_error=None)  # PMU readable
+    b = make(tree)
+    (dev,) = b.get_devices()
+    tree.clock.advance(1.0)
+    tree.pmu_values = {0x0: 400_000_000}
+    set_rc6(10_000 + 900)  # would say 10 %; must be ignored
+    s = b.sample(dev)
+    assert s.util_gpu == 40.0 and not s.util_estimated
+    assert s.engine_util["render"] == 40.0 and s.notes == ()
+
+
+def test_rc6_without_any_pmu_has_no_warning(tree):
+    from fake_sysfs import set_rc6
+
+    igpu(tree)  # no i915 PMU at all (e.g. xe driver)
+    set_rc6(tree, 1, 0)
+    b = make(tree)
+    (dev,) = b.get_devices()
+    tree.clock.advance(1.0)
+    set_rc6(tree, 1, 600)
+    s = b.sample(dev)
+    assert s.util_gpu == 40.0 and s.util_estimated and s.notes == ()
+
+
+def test_engine_labels_are_short():
+    from gputop.backends.intel import _engine_label
+
+    assert [_engine_label(e) for e in ("rcs0", "bcs0", "vcs0", "vcs1", "vecs0", "ccs0")] == \
+        ["render", "copy", "video", "video1", "enh", "comp"]

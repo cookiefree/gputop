@@ -189,7 +189,9 @@ def test_theme_cycle_and_help():
     async def scenario(pilot, app):
         await pilot.press("t")
         assert app.gtheme.name == "dracula"
-        assert str(app.screen.styles.background.hex).lower() == "#282a36"
+        assert app.gtheme["main_bg"] == "#282a36"
+        assert not app.gtheme.background  # default: the terminal's own background
+        assert app.gtheme.base_style.bgcolor.is_default
         for _ in range(3):
             await pilot.press("t")
         assert app.gtheme.name == "default"
@@ -429,3 +431,41 @@ def test_sigusr1_requests_rediscovery(tmp_path):
             signal.signal(signal.SIGUSR1, signal.SIG_DFL)
 
     run(app, scenario, size=(120, 50))
+
+
+def test_stats_rows_never_clip_a_label_from_its_value():
+    from gputop.backends.base import GPUInfo, GPUSample
+    from gputop.sampler import DeviceState, RingBuffer, HISTORY_METRICS
+    from gputop.themes import Theme
+    from gputop.widgets.gpu_panel import STATS_W, stats_rows
+
+    st = DeviceState(info=GPUInfo(index=0, name="x"), history={m: RingBuffer(4) for m in HISTORY_METRICS})
+    st.latest = GPUSample(index=0, util_gpu=10.0, util_mem=12.0, enc_util=1.0, dec_util=2.0,
+                          engine_util={"render": 22.4, "copy": 0.0, "video": 100.0, "video1": 3.0, "enh": 0.0})
+    rows = [t.plain for name, t in stats_rows(st, Theme("default"), STATS_W) if name == "mctl"]
+    assert len(rows) >= 2  # wrapped onto a second row instead of clipping
+    text = " ".join(rows)
+    for label, value in (("render", "22%"), ("video", "100%"), ("enh", "0%"), ("dec", "2%")):
+        assert f"{label} {value}" in text
+    assert all(len(r) <= STATS_W for r in rows)
+
+
+def test_theme_background_option_paints_main_bg():
+    from gputop.config import Config
+
+    app = make_app()
+    app.config = Config(theme_background=True)
+
+    async def scenario(pilot, app):
+        app.apply_theme(app.themes["dracula"])
+        await pilot.pause(0.1)
+        assert str(app.screen.styles.background.hex).lower() == "#282a36"
+        assert app.gtheme.base_style.bgcolor.triplet.hex == "#282a36"
+
+    run(app, scenario)
+
+
+def test_default_is_terminal_background():
+    from gputop.config import Config
+
+    assert Config().theme_background is False

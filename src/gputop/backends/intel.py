@@ -55,7 +55,9 @@ _CARD_RE = re.compile(r"^card\d+$")
 _FDINFO_SCAN_INTERVAL = 5.0  # seconds between full /proc scans for DRM clients
 
 # i915 PMU engine classes -> friendly names (instance > 0 gets a suffix).
-_ENGINE_NAMES = {"rcs": "render", "bcs": "copy", "vcs": "video", "vecs": "enhance", "ccs": "compute"}
+# Kept short so a full engine breakdown fits the 38-column stats panel.
+_ENGINE_NAMES = {"rcs": "render", "bcs": "copy", "vcs": "video", "vecs": "enh", "ccs": "comp"}
+RC6_HINT = "util is estimated (RC6); perf_event_paranoid=0 for exact"
 # fdinfo engine keys (drm-engine-<name>) that count as "compute" work.
 _COMPUTE_ENGINES = {"compute", "ccs"}
 
@@ -254,6 +256,8 @@ class _Card:
     notes: tuple[str, ...] = ()
     throttle_dir: Path | None = None
     ready: bool = False  # per-card setup done (only ever for awake cards)
+    rc6: Path | None = None  # RC6 residency counter (util estimate without the PMU)
+    rc6_prev: tuple[int, float] | None = None
 
 
 @dataclass
@@ -374,12 +378,43 @@ class IntelBackend(GPUBackend):
         card.energy = self._find_energy(card)
         notes = []
         card.engines, note = self._open_engines(card)
+        if card.engines is None:
+            # No exact engine counters (perf not permitted, or no PMU): estimate
+            # utilisation from RC6 residency, which is world-readable.
+            card.rc6 = self._find_rc6(card)
+            if card.rc6 is not None:
+                note = RC6_HINT if note else None
         if note:
             notes.append(note)
         if card.energy is not None and card.energy.label == "package":
             notes.append("power shown is the whole CPU package (no GPU RAPL domain)")
         card.notes = tuple(notes)
         card.ready = True
+
+    def _find_rc6(self, card: _Card) -> Path | None:
+        """The card's RC6 residency counter (ms), primed for delta sampling."""
+        for path in (card.sys / "power" / "rc6_residency_ms", card.sys / "gt" / "gt0" / "rc6_residency_ms"):
+            value = _read_int(path)
+            if value is not None:
+                card.rc6_prev = (value, self._clock())
+                return path
+        return None
+
+    def _rc6_util(self, card: _Card) -> float | None:
+        """util = 100 - (time spent in RC6 / elapsed time), over the last interval."""
+        assert card.rc6 is not None
+        value, now = _read_int(card.rc6), self._clock()
+        prev = card.rc6_prev
+        if value is None:
+            return None
+        card.rc6_prev = (value, now)
+        if prev is None:
+            return None
+        dt_ms = (now - prev[1]) * 1000.0
+        delta = value - prev[0]
+        if dt_ms <= 0 or delta < 0:  # counter reset / wrapped: start a new baseline
+            return None
+        return round(max(0.0, min(100.0, 100.0 - 100.0 * delta / dt_ms)), 1)
 
     def _find_temp(self, card: _Card) -> Path | None:
         # Discrete cards: their own hwmon.
@@ -576,6 +611,9 @@ class IntelBackend(GPUBackend):
                 s.engine_util = {_engine_label(k): round(v, 1) for k, v in sorted(busy.items())}
                 main = [v for k, v in busy.items() if k.startswith(("rcs", "ccs"))]
                 s.util_gpu = round(max(main) if main else max(busy.values()), 1)
+        elif card.rc6 is not None:
+            s.util_gpu = self._rc6_util(card)
+            s.util_estimated = True  # no per-engine breakdown in this mode
 
         if card.temp is not None:
             t = _read_int(card.temp)

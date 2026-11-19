@@ -79,6 +79,7 @@ class GPUSample:
 
     util_gpu: float | None = None
     util_mem: float | None = None
+    util_estimated: bool = False  # util_gpu is an estimate (e.g. Intel RC6), not a counter
 
     mem_used: int | None = None
     mem_total: int | None = None

@@ -247,3 +247,10 @@ def drm_fdinfo(pci: str = "0000:00:02.0", client_id: int = 1, engines: dict[str,
 
 
 __all__ = ["FakeSysfs", "drm_fdinfo", "errno"]
+
+
+def set_rc6(tree: FakeSysfs, card: int, ms: int, where: str = "power") -> None:
+    """RC6 residency counter (ms) at card*/power/ or card*/gt/gt0/."""
+    rel = f"sys/class/drm/card{card}/power/rc6_residency_ms" if where == "power" \
+        else f"sys/class/drm/card{card}/gt/gt0/rc6_residency_ms"
+    tree.write(rel, str(ms))

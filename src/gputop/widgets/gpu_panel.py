@@ -334,9 +334,10 @@ def stats_rows(st: DeviceState, th: Theme, width: int) -> list[tuple[str, Text]]
     meter_w = max(1, width - LABEL_W - 1 - VALUE_W)
     out: list[tuple[str, Text]] = []
 
-    def meter_row(name: str, frac: float | None, grad: str, val: str, val_style: Style) -> Text:
+    def meter_row(name: str, frac: float | None, grad: str, val: str, val_style: Style,
+                  name_style: Style | None = None) -> Text:
         t = Text(no_wrap=True)
-        t.append(name.ljust(LABEL_W), label)
+        t.append(name.ljust(LABEL_W), name_style or label)
         if frac is not None:
             t.append_text(btop_meter(frac, meter_w, th, grad))
         else:
@@ -357,8 +358,9 @@ def stats_rows(st: DeviceState, th: Theme, width: int) -> list[tuple[str, Text]]
         frac = None if s.mem_percent is None else s.mem_percent / 100
         out.append(("vram", meter_row("vram", frac, "vram", fmt.mem_compact(s.mem_used, s.mem_total), value)))
     if s.util_gpu is not None:
-        out.append(("util", meter_row("util", s.util_gpu / 100, "util", fmt.pct(s.util_gpu),
-                                      th.grad("util", s.util_gpu / 100))))
+        out.append(("util", meter_row("util~" if s.util_estimated else "util", s.util_gpu / 100, "util",
+                                      fmt.pct(s.util_gpu), th.grad("util", s.util_gpu / 100),
+                                      dim if s.util_estimated else None)))
     if s.power_draw is not None:
         limit = s.power_limit or info.power_limit_max
         frac = s.power_draw / limit if limit else None
@@ -401,8 +403,18 @@ def stats_rows(st: DeviceState, th: Theme, width: int) -> list[tuple[str, Text]]
             if t.cell_len + len(link) <= width:
                 t.append(link, dim)
         out.append(("pcie", t))
-    if codec:
-        out.append(("mctl", pairs(codec)))
+    # Pack whole "label value" pairs into rows; a pair that doesn't fit starts
+    # a new row, so a label is never clipped away from its value.
+    row: list[tuple[str, str, Style]] = []
+    for item in codec:
+        trial = row + [item]
+        if row and sum(len(n) + len(v) for n, v, _ in trial) + 2 * (len(trial) - 1) > width:
+            out.append(("mctl", pairs(row)))
+            row = [item]
+        else:
+            row = trial
+    if row:
+        out.append(("mctl", pairs(row)))
     return [(name, _fit(t, width, th)) for name, t in out]
 
 
@@ -478,7 +490,9 @@ def graph_area(st: DeviceState, th: Theme, w: int, h: int, util_only: bool = Fal
     ph = h - uh
     out: list[Text] = []
     if has_util:
-        out += labelled_graph(hist["util_gpu"].tail(w * 2), w, uh, th, "util", 100.0, Text("util", gt))
+        # "util~": estimated (Intel RC6 residency), not an exact counter.
+        name = "util~" if s.util_estimated else "util"
+        out += labelled_graph(hist["util_gpu"].tail(w * 2), w, uh, th, "util", 100.0, Text(name, gt))
     else:
         # No utilisation (e.g. Intel without perf access; the reason is shown in
         # the box's bottom border): the clock history stands in for it, since

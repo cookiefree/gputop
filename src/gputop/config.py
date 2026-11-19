@@ -32,7 +32,7 @@ class Config:
     view: str = "all"  # "all" or "detail"
     color: str = "auto"  # auto, truecolor, 256, 16
     rounded_corners: bool = True  # btop's default; false draws square corners
-    theme_background: bool = True  # false: keep the terminal's own background
+    theme_background: bool = False  # default: terminal background; true paints the theme main_bg (btop default)
 
     @classmethod
     def load(cls, path: Path | None = None) -> Config:
