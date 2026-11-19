@@ -7,6 +7,13 @@ btop's Default colours, braille area graphs with vertical gradients, `■`
 meters, a sortable process box, mouse support and btop-format themes. It
 handles any number of GPUs at once.
 
+![gputop on a MacBook Pro: the Intel iGPU live, the NVIDIA dGPU shown as OFF](docs/screenshot.png)
+
+*A real laptop: the Intel iGPU is `● ACTIVE` with live stats and processes;
+the NVIDIA GT 750M (on nouveau, switched off) is still listed, as `● OFF`.*
+
+With `--backend fake --fake-gpus 2` (synthetic data, no GPU needed):
+
 ```
 ╭─┐¹gpu0┌┐RTX 4090┌──┐help┌─────────┐13:48:11┌─────────────────────┐- 500ms +┌─╮
 │ util           ⣴⣶⣶⣶⣶⣶⣦⣴⣶⣶⣶⣤⣴⣶⣶⣴⣶⣶⣴⣦⣦ │vram  ■■■■■■■■■■■■■■■■■■■■■ 11.0/24.0G │
