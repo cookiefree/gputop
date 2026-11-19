@@ -51,8 +51,12 @@ handles any number of GPUs at once.
   C+G). Sort by any column, reverse, filter by text, scroll.
 - Metrics a card or driver doesn't support (per-process utilisation, power limit
   on laptops, fan on passively cooled cards…) are simply hidden.
-- **NVIDIA** (NVML) and **Intel** (i915 sysfs + perf PMU) backends; `--backend
-  auto` shows every GPU from every available backend side by side.
+- **Every GPU on the machine**, including ones that are off, runtime-suspended,
+  have no driver or use a driver gputop can't read (nouveau, vfio-pci), each
+  with a status: `● ACTIVE`, `● SUSPENDED`, `● OFF`, `● NO DRIVER`,
+  `● UNSUPPORTED`. Sleeping GPUs are **never woken** to be inspected.
+- **NVIDIA** (NVML) and **Intel** (i915 sysfs + perf PMU) live stats; the
+  default `--backend auto` uses every backend that works.
 - Truecolor with automatic 256-colour fallback; works over SSH and in tmux.
 - Themes: `default`, `dracula`, `gruvbox`, `nord`, plus your own (btop `.theme`
   files work as-is).
@@ -81,25 +85,68 @@ gputop --backend fake --fake-gpus 4
 
 ```
 gputop [--interval MS] [--theme NAME] [--gpu INDEX[,INDEX...]] [--no-mouse]
-       [--backend {nvidia,intel,auto,fake,amd}] [--color {auto,truecolor,256,16}]
-gputop --list      # print detected GPUs and exit
+       [--backend auto|nvidia|intel|amd|fake|nvidia,intel] [--no-pci]
+       [--color {auto,truecolor,256,16}]
+gputop --list      # print every GPU with its status and exit
 gputop --once      # print one snapshot as JSON and exit (for scripting)
 ```
 
-`--once` output is a JSON object with `timestamp`, `backend` and a `gpus` list;
-each entry has `info` (static facts), `sample` (all metrics, `null` when
-unsupported; bytes, watts, MHz, °C, %) and `processes`.
-
-```sh
-gputop --once | jq '.gpus[] | {name: .info.name, util: .sample.util_gpu}'
+```
+$ gputop --list
+GPU 0: Intel Crystal Well Integrated Graphics Controller · 0000:00:02.0 · ACTIVE (i915, D0) · driver i915 7.3.4
+GPU 1: NVIDIA GK107M [GeForce GT 750M Mac Edition] · 0000:01:00.0 · OFF (nouveau, D3hot)
 ```
 
-Exit codes: `0` ok, `1` no usable backend/GPU (e.g. NVML missing), `2` bad
-arguments.
+`--once` prints a JSON object with `timestamp`, `backend` and a `gpus` list.
+Each entry has `index`, `name`, `vendor`, `pci_address`, `status`, `driver`,
+`power_state`, `live_stats_available`, plus `info` (static facts), `sample`
+(all metrics, `null` for GPUs without live stats; bytes, watts, MHz, °C, %)
+and `processes`.
 
-`--backend auto` tries every real backend (NVIDIA, Intel), uses all that find
-a GPU and numbers their devices 0..N-1; `--list` notes which backends were
-skipped and why. To make it the default, set `backend = "auto"` in the config.
+```sh
+gputop --once | jq '.gpus[] | {name, status, util: .sample.util_gpu}'
+```
+
+**Backends.** `--backend auto` (the default) probes NVIDIA, Intel and AMD and
+silently skips any that don't work (`--list` prints why on stderr). An explicit
+`--backend nvidia` or list `nvidia,intel` forces those backends: if one fails
+to start, that's an error. Either way, GPUs found by PCI discovery are shown
+too unless you pass `--no-pci`. `--backend fake` shows only synthetic GPUs.
+
+Exit codes: `0` ok, `1` no GPU found at all (the error lists, per backend, why
+it was skipped), or a forced backend failed; `2` bad arguments.
+
+### Every GPU, on or off
+
+gputop enumerates all PCI display controllers (`/sys/bus/pci/devices`, class
+`0x03xxxx`) independently of the vendor backends, so every GPU gets a box,
+whatever its state:
+
+| Status | Meaning |
+| --- | --- |
+| `● ACTIVE` | driver bound, device awake, live stats from a backend |
+| `● SUSPENDED` | driver bound but runtime-suspended (D3hot/D3cold) |
+| `● OFF` | powered off / disabled (`enable=0`, D3cold without a driver, vga_switcheroo off) |
+| `● NO DRIVER` | present but no kernel driver bound |
+| `● UNSUPPORTED` | awake but on a driver gputop can't read (nouveau, vfio-pci) or its backend failed |
+
+GPUs without live stats keep the same box with empty graphs, a short
+explanation ("suspended (D3cold) - not queried to avoid waking it") and their
+static facts (vendor, device id, PCI address, driver, power state, boot VGA).
+Their history freezes and resumes when they wake up, and the process list only
+covers ACTIVE GPUs. Press `Shift+R` or send `SIGUSR1` (`kill -USR1 <pid>`) to
+re-run discovery after a hot-plug or driver change.
+
+**Never waking a GPU.** A runtime-suspended GPU powers up if anything opens it,
+reads a sensor or queries its driver. For the status gputop only reads cheap
+PCI attributes (`enable`, `driver`, `power/runtime_status`, `power_state`,
+`boot_vga`, and vga_switcheroo if readable). A vendor backend is only used for
+a GPU while those say it is awake: NVML isn't even initialised (and then only
+with `NVML_INIT_FLAG_NO_ATTACH`, looking GPUs up by PCI address) until an
+NVIDIA GPU on the `nvidia` driver is awake, and when all of a backend's GPUs
+go to sleep the backend is shut down so it doesn't hold them open. Note that
+polling an *active* GPU every refresh keeps it busy enough that it may not
+autosuspend while gputop runs; slow the refresh with `-` if that matters.
 
 ### Intel GPUs
 
@@ -141,6 +188,7 @@ clients are rediscovered every 5 seconds.
 | `a` / `Enter` | toggle all-GPUs overview ↔ single-GPU detail view |
 | `↑` `↓` `PgUp` `PgDn` `Home` `End` | select process |
 | `s` / `r` | cycle sort column / reverse sort |
+| `Shift+R` | re-run GPU discovery (same as `kill -USR1 <pid>`) |
 | `f` (or `/`) | filter processes by command, user or PID, typed into the `┐filter:┌` tab (`Enter` keeps, `Esc` clears) |
 | `+` / `-` | refresh faster / slower (100 ms – 5 s) |
 | `t` | cycle theme |
@@ -158,7 +206,7 @@ the process list. Disable with `--no-mouse`.
 interval_ms = 500
 theme = "default"
 mouse = true
-backend = "nvidia"
+backend = "auto"       # or nvidia, intel, amd, fake, or a list: "nvidia,intel"
 sort_key = "vram"      # pid, user, command, gpu, vram, sm, type
 sort_reverse = false
 view = "all"           # or "detail"
@@ -238,12 +286,13 @@ src/gputop/
 ├── themes.py            built-in themes, btop/TOML theme loading, gradients
 ├── fmt.py               unit formatting
 ├── procinfo.py          PID -> user/command via psutil (cached)
+├── pcidiscovery.py      all PCI display controllers + non-waking status
 ├── sampler.py           background polling thread + ring buffers
 ├── backends/
 │   ├── base.py          GPUBackend ABC + GPUInfo / GPUSample / GPUProcess
 │   ├── nvidia.py        NVML implementation
 │   ├── intel.py         i915/xe via sysfs, perf PMU, RAPL, hwmon, fdinfo
-│   ├── composite.py     --backend auto: several backends side by side
+│   ├── machine.py       every GPU: PCI discovery merged with live backends
 │   ├── fake.py          synthetic multi-GPU backend (--backend fake)
 │   └── amd.py           documented stub with an implementation plan
 └── widgets/
@@ -282,7 +331,8 @@ gputop --backend fake --fake-gpus 3      # run the UI on synthetic data
 The test suite covers the braille renderer, meters, ring buffers and the
 sampler (including GPU loss and vanished processes), the NVIDIA backend against
 a mocked NVML, the Intel backend against a fake sysfs/procfs tree
-(`tests/fake_sysfs.py`), `--backend auto`, themes, config, the CLI,
+(`tests/fake_sysfs.py`), PCI discovery and `--backend auto` (including a test
+that no backend is ever queried about a sleeping GPU), themes, config, the CLI,
 and the UI itself driven headless through Textual's pilot (keys, mouse, resize,
 filter, detail view, GPU loss mid-run).
 

@@ -155,6 +155,8 @@ class Sampler:
         self._history_len = max(1, int(history))
         self._filter = None if device_filter is None else set(device_filter)
         self.on_update = on_update
+        self.on_rediscover: Callable[[bool], None] | None = None
+        self._rediscover_requested = False
         self._resolver = ProcessResolver() if resolve_processes else None
         self._lock = threading.RLock()
         self._wake = threading.Event()
@@ -186,6 +188,35 @@ class Sampler:
                 for d in devices
             ]
             return list(self._devices)
+
+    def rediscover(self) -> bool:
+        """Re-run device discovery (e.g. on SIGUSR1). Keeps the history of
+        GPUs that are still present (matched by PCI address or UUID).
+        Returns True if the device list changed."""
+        hook = getattr(self.backend, "rediscover", None)
+        if hook is not None:
+            hook()
+        old = {self._key(d.info): d for d in self.devices}
+        before = [self._key(d.info) for d in self.devices]
+        devices = self.backend.get_devices()
+        if self._filter is not None:
+            devices = [d for d in devices if d.index in self._filter]
+        with self._lock:
+            states = []
+            for info in devices:
+                prev = old.get(self._key(info))
+                if prev is not None:
+                    prev.info = info
+                    states.append(prev)
+                else:
+                    states.append(DeviceState(info=info, history={
+                        m: RingBuffer(self._history_len, self._lock) for m in HISTORY_METRICS}))
+            self._devices = states
+        return [self._key(d) for d in devices] != before
+
+    @staticmethod
+    def _key(info: GPUInfo) -> str:
+        return info.pci_address or info.uuid or f"{info.name}#{info.index}"
 
     @property
     def devices(self) -> list[DeviceState]:
@@ -250,13 +281,22 @@ class Sampler:
                 except Exception:  # psutil oddities must not kill sampling
                     log.exception("process resolution failed")
 
+            try:
+                info = self.backend.refresh_info(dev.info)
+            except Exception:  # noqa: BLE001 - keep the old info
+                info = dev.info
+
             with self._lock:
+                dev.info = info
                 dev.latest = sample
                 dev.processes = procs
                 dev.error = None
-                for metric, buf in dev.history.items():
-                    value = getattr(sample, metric, None)
-                    buf.append(None if value is None else float(value))
+                # A GPU that is off/suspended/unreadable isn't queried: its
+                # history freezes and resumes when it wakes up.
+                if sample.live:
+                    for metric, buf in dev.history.items():
+                        value = getattr(sample, metric, None)
+                        buf.append(None if value is None else float(value))
         with self._lock:
             self.generation += 1
             gen = self.generation
@@ -267,9 +307,24 @@ class Sampler:
             except Exception:
                 log.exception("on_update callback failed")
 
+    def request_rediscover(self) -> None:
+        """Ask the sampler thread to re-run discovery before its next poll
+        (so it never races with sampling). Thread-safe."""
+        self._rediscover_requested = True
+        self._wake.set()
+
     def _run(self) -> None:
         while not self._stopping:
             started = time.monotonic()
+            if self._rediscover_requested:
+                self._rediscover_requested = False
+                try:
+                    changed = self.rediscover()
+                except Exception:  # discovery problems must not stop sampling
+                    log.exception("rediscovery failed")
+                    changed = False
+                if self.on_rediscover is not None:
+                    self.on_rediscover(changed)
             self.poll_once()
             if self._stopping:
                 break

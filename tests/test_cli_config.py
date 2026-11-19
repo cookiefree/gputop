@@ -49,7 +49,9 @@ def test_nvidia_without_nvml_exits_1(capsys, monkeypatch):
         raise pynvml.NVMLError(pynvml.NVML_ERROR_LIBRARY_NOT_FOUND)
 
     monkeypatch.setattr(pynvml, "nvmlInit", boom)
-    assert main(["--backend", "nvidia", "--list"]) == 1
+    monkeypatch.setattr(pynvml, "nvmlInitWithFlags", lambda *a: boom(), raising=False)
+    # --no-pci: independent of the GPUs in the machine running the tests
+    assert main(["--backend", "nvidia", "--no-pci", "--list"]) == 1
     err = capsys.readouterr().err
     assert "NVML" in err and "--backend fake" in err
 

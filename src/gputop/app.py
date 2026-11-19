@@ -33,6 +33,14 @@ MIN_BOX_HEIGHT = 3  # top border + 1 row + bottom border
 TWO_COLUMN_WIDTH = 160
 
 
+class Rediscovered(Message):
+    """Posted by the sampler thread after GPU rediscovery."""
+
+    def __init__(self, changed: bool) -> None:
+        super().__init__()
+        self.changed = changed
+
+
 class SampleReady(Message):
     """Posted (thread-safely) by the sampler thread after each poll."""
 
@@ -81,6 +89,7 @@ class GpuTopApp(App[None]):
         Binding("enter", "toggle_view", show=False),
         Binding("s", "cycle_sort", "sort"),
         Binding("r", "reverse_sort", "reverse"),
+        Binding("R", "rediscover", "rediscover GPUs", show=False),
         Binding("plus,equals_sign", "interval(-1)", "faster", show=False),
         Binding("minus,underscore", "interval(1)", "slower", show=False),
         Binding("t", "cycle_theme", "theme"),
@@ -170,6 +179,7 @@ class GpuTopApp(App[None]):
 
     def on_mount(self) -> None:
         self.sampler.on_update = lambda gen: self.post_message(SampleReady(gen))
+        self.sampler.on_rediscover = lambda changed: self.post_message(Rediscovered(changed))
         self.apply_theme(self.gtheme)
         if self.panels:
             self.panels[0].set_selected(True)
@@ -183,6 +193,7 @@ class GpuTopApp(App[None]):
 
     def on_unmount(self) -> None:
         self.sampler.on_update = None
+        self.sampler.on_rediscover = None
         self.sampler.stop()
 
     def _tick_clock(self) -> None:
@@ -384,6 +395,38 @@ class GpuTopApp(App[None]):
     def action_filter(self) -> None:
         if self.table.display:
             self.table.start_edit()
+
+    # -- rediscovery (Shift+R / SIGUSR1) ---------------------------------------
+
+    def request_rediscover(self) -> None:
+        """Safe to call from a signal handler."""
+        self.sampler.request_rediscover()
+
+    def action_rediscover(self) -> None:
+        self.request_rediscover()
+        self.notify("rediscovering GPUs…", timeout=1.5)
+
+    def on_rediscovered(self, message: Rediscovered) -> None:
+        if not self._live or not message.changed:
+            return
+        if self.detail_mode:
+            self.detail_mode = False
+            self._exit_detail()
+        for panel in self.panels:
+            panel.remove()
+        self.panels = []
+        for pos, dev in enumerate(self.sampler.devices):
+            panel = GpuPanel(dev, self.gtheme, hotkey=pos + 1 if pos < 9 else None)
+            panel.interval_ms = self._interval_ms
+            self.panels.append(panel)
+        self.overview.mount(*self.panels)
+        self.focus_pos = 0
+        if self.panels:
+            self.panels[0].set_selected(True)
+        self._place_clock()
+        self._last_layout = None
+        self.call_after_refresh(self.relayout)
+        self.notify(f"{len(self.panels)} GPU{'s' if len(self.panels) != 1 else ''} found", timeout=2)
 
     # -- misc -----------------------------------------------------------------
 

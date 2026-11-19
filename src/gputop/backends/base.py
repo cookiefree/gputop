@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Collection
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -50,6 +51,9 @@ class GPUInfo:
     clock_sm_max: int | None = None
     clock_mem_max: int | None = None
     power_limit_max: float | None = None
+    pci_address: str = ""  # "0000:01:00.0" (sysfs form); "" if unknown
+    pci_ids: str = ""  # "10de:0fe9"
+    boot_vga: bool | None = None
 
     @property
     def short_uuid(self) -> str:
@@ -108,6 +112,16 @@ class GPUSample:
     # One-line hints for the user about hidden metrics, e.g. missing
     # permissions ("GPU util hidden: needs perf access ...").
     notes: tuple[str, ...] = ()
+
+    # Device state from PCI discovery (see gputop.pcidiscovery). ``live`` is
+    # False when no backend was queried (GPU off/suspended/no driver/...):
+    # then only the status fields are meaningful and history is frozen.
+    live: bool = True
+    status: str | None = None  # ACTIVE / SUSPENDED / OFF / NO DRIVER / UNSUPPORTED
+    status_detail: str | None = None  # human explanation for non-live GPUs
+    driver: str | None = None
+    power_state: str | None = None  # D0 / D3hot / D3cold
+    runtime_status: str | None = None  # active / suspended / unsupported
 
     @property
     def mem_percent(self) -> float | None:
@@ -210,6 +224,20 @@ class GPUBackend(ABC):
     @abstractmethod
     def get_processes(self, device: GPUInfo) -> list[GPUProcess]:
         """Return the processes currently using ``device``."""
+
+    def get_devices_for(self, addresses: Collection[str]) -> list[GPUInfo]:
+        """Devices at the given PCI addresses only.
+
+        Used for GPUs known to be awake, so a backend never has to touch a
+        sleeping device. Backends that can look devices up by PCI address
+        without enumerating (NVML, sysfs) override this.
+        """
+        want = set(addresses)
+        return [d for d in self.get_devices() if d.pci_address in want]
+
+    def refresh_info(self, device: GPUInfo) -> GPUInfo:
+        """Current static info for ``device`` (may change when it wakes up)."""
+        return device
 
     def supports_processes(self, device: GPUInfo) -> bool:
         """Whether per-process data exists for ``device`` at all.

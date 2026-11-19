@@ -271,7 +271,7 @@ def make_intel_app(tmp_path, with_clients=False, with_nvidia=False, pmu_denied=T
     from fake_backend import ScriptedBackend
     from fake_sysfs import FakeSysfs, drm_fdinfo
     from gputop.backends.base import GPUProcess
-    from gputop.backends.composite import CompositeBackend
+    from gputop.backends.machine import MachineBackend
     from gputop.backends.intel import IntelBackend
 
     tree = FakeSysfs(tmp_path)
@@ -286,7 +286,7 @@ def make_intel_app(tmp_path, with_clients=False, with_nvidia=False, pmu_denied=T
     if with_nvidia:
         cuda_app = GPUProcess(pid=9, gpu_index=0, vram_used=1 << 30, user="u", command="cuda-app")
         nv = ScriptedBackend(count=1, processes={0: [cuda_app]})
-        backend = CompositeBackend([("nvidia", lambda: nv), ("intel", lambda: intel)])
+        backend = MachineBackend([("nvidia", lambda: nv), ("intel", lambda: intel)], use_pci=False)
     else:
         backend = intel
     sampler = Sampler(backend, interval=0.1, resolve_processes=False)
@@ -345,3 +345,87 @@ def test_mixed_vendors_table_follows_focused_gpu(tmp_path):
         assert app.table.display and "cuda-app" in screen_text(app)
 
     run(make_intel_app(tmp_path, with_nvidia=True), scenario)
+
+
+# -- PCI-only GPUs (off / suspended / no driver) --------------------------------------
+
+
+def make_pci_app(tmp_path):
+    from fake_sysfs import FakeSysfs, drm_fdinfo
+    from gputop.backends.intel import IntelBackend
+    from gputop.backends.machine import MachineBackend
+
+    tree = FakeSysfs(tmp_path)
+    tree.add_card(0, pci="0000:00:02.0")
+    tree.add_pci("0000:01:00.0", driver="nvidia", runtime_status="suspended", power_state="D3cold")
+    tree.add_pci("0000:02:00.0", driver=None, enable=0, power_state="D3cold")
+    tree.add_proc(50, "kitty", ["kitty"], {3: ("/dev/dri/renderD128", drm_fdinfo())})
+    m = MachineBackend([("intel", lambda: IntelBackend(root=tree.root, counter_opener=tree.open_counter,
+                                                       clock=tree.clock))], root=str(tree.root))
+    sampler = Sampler(m, interval=0.1, resolve_processes=False)
+    sampler.discover()
+    for _ in range(3):
+        sampler.poll_once()
+    return GpuTopApp(sampler, available_themes(None), "default", backend_label="test"), tree
+
+
+def test_off_and_suspended_gpus_get_boxes(tmp_path):
+    app, tree = make_pci_app(tmp_path)
+
+    async def scenario(pilot, app):
+        text = screen_text(app)
+        assert len(app.panels) == 3
+        assert "┐● ACTIVE┌" in text and "┐● SUSPENDED┌" in text and "┐● OFF┌" in text
+        assert "suspended (D3cold) - not queried to avoid waking it" in text
+        assert "GPU is off - no data" in text
+        assert "┐0000:01:00.0┌" in text  # name + PCI address in the title
+        assert "driver nvidia" in text and "power  D3cold" in text
+        # processes only for the ACTIVE GPU
+        assert {p.gpu_index for p in app.table.rows} == {0}
+        await pilot.press("2")  # hotkeys cover PCI-only GPUs too
+        assert app.focus_pos == 1
+        await pilot.press("a")
+        await pilot.pause(0.3)
+        assert not app.table.display  # a suspended GPU has no processes
+        assert not any(b.display for b in app._detail.boxes)  # no stale graphs
+
+    run(app, scenario, size=(120, 40))
+
+
+def test_rediscover_key_rebuilds_boxes(tmp_path):
+    app, tree = make_pci_app(tmp_path)
+
+    async def scenario(pilot, app):
+        assert len(app.panels) == 3
+        tree.add_pci("0000:03:00.0", driver=None)  # hot-plugged GPU
+        await pilot.press("R")
+        for _ in range(20):
+            await pilot.pause(0.1)
+            if len(app.panels) == 4:
+                break
+        assert len(app.panels) == 4
+        assert "┐● NO DRIVER┌" in screen_text(app)
+
+    run(app, scenario, size=(120, 50))
+
+
+def test_sigusr1_requests_rediscovery(tmp_path):
+    import os
+    import signal
+
+    app, tree = make_pci_app(tmp_path)
+
+    async def scenario(pilot, app):
+        signal.signal(signal.SIGUSR1, lambda s, f: app.request_rediscover())
+        try:
+            tree.add_pci("0000:03:00.0", driver=None)
+            os.kill(os.getpid(), signal.SIGUSR1)
+            for _ in range(20):
+                await pilot.pause(0.1)
+                if len(app.panels) == 4:
+                    break
+            assert len(app.panels) == 4
+        finally:
+            signal.signal(signal.SIGUSR1, signal.SIG_DFL)
+
+    run(app, scenario, size=(120, 50))

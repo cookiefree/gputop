@@ -74,15 +74,7 @@ class FakeSysfs:
         throttle: dict[str, int] | None = None,
         connectors: tuple[str, ...] = ("eDP-1",),
     ) -> Path:
-        dev = self.root / "sys/devices/pci0000:00" / pci
-        dev.mkdir(parents=True, exist_ok=True)
-        self.write(f"sys/devices/pci0000:00/{pci}/vendor", vendor)
-        self.write(f"sys/devices/pci0000:00/{pci}/device", device_id)
-        self.write(f"sys/devices/pci0000:00/{pci}/class", "0x030000")
-        drv = self.root / "sys/bus/pci/drivers" / driver
-        drv.mkdir(parents=True, exist_ok=True)
-        if not (dev / "driver").exists():
-            os.symlink(drv, dev / "driver")
+        dev = self.add_pci(pci, vendor=vendor, device_id=device_id, driver=driver)
         card = self.root / f"sys/class/drm/card{n}"
         card.mkdir(parents=True, exist_ok=True)
         os.symlink(dev, card / "device")
@@ -101,6 +93,60 @@ class FakeSysfs:
             for key, value in throttle.items():
                 self.write(f"sys/class/drm/card{n}/gt/gt0/throttle_reason_{key}", str(value))
         return dev
+
+    def add_pci(
+        self,
+        address: str,
+        vendor: str = "0x10de",
+        device_id: str = "0x1f9d",
+        klass: str = "0x030000",
+        driver: str | None = "nvidia",
+        enable: int | None = 1,
+        runtime_status: str | None = "active",
+        power_state: str | None = "D0",
+        boot_vga: int | None = 0,
+    ) -> Path:
+        """A PCI function under /sys/devices, linked from /sys/bus/pci/devices."""
+        dev = self.root / "sys/devices/pci0000:00" / address
+        dev.mkdir(parents=True, exist_ok=True)
+        (dev / "vendor").write_text(vendor + "\n")
+        (dev / "device").write_text(device_id + "\n")
+        (dev / "class").write_text(klass + "\n")
+        for name, value in (("enable", enable), ("power_state", power_state), ("boot_vga", boot_vga)):
+            if value is not None:
+                (dev / name).write_text(f"{value}\n")
+        if runtime_status is not None:
+            (dev / "power").mkdir(exist_ok=True)
+            (dev / "power" / "runtime_status").write_text(runtime_status + "\n")
+        self.set_driver(address, driver)
+        bus = self.root / "sys/bus/pci/devices"
+        bus.mkdir(parents=True, exist_ok=True)
+        if not (bus / address).exists():
+            os.symlink(dev, bus / address)
+        return dev
+
+    def set_driver(self, address: str, driver: str | None) -> None:
+        dev = self.root / "sys/devices/pci0000:00" / address
+        link = dev / "driver"
+        if link.is_symlink():
+            link.unlink()
+        if driver:
+            drv = self.root / "sys/bus/pci/drivers" / driver
+            drv.mkdir(parents=True, exist_ok=True)
+            os.symlink(drv, link)
+
+    def set_power(self, address: str, runtime_status: str | None = None, power_state: str | None = None,
+                  enable: int | None = None) -> None:
+        dev = self.root / "sys/devices/pci0000:00" / address
+        if runtime_status is not None:
+            (dev / "power" / "runtime_status").write_text(runtime_status + "\n")
+        if power_state is not None:
+            (dev / "power_state").write_text(power_state + "\n")
+        if enable is not None:
+            (dev / "enable").write_text(f"{enable}\n")
+
+    def set_switcheroo(self, lines: list[str]) -> None:
+        self.write("sys/kernel/debug/vgaswitcheroo/switch", "\n".join(lines))
 
     def add_card_hwmon(self, pci: str, temp_mc: int | None = None, energy_uj: int | None = None,
                        power_max_uw: int | None = None) -> Path:
@@ -164,8 +210,11 @@ class FakeSysfs:
             self.write(f"{base}/events/{engine}-wait", f"config={config + 1:#x}")
         self.write(f"{base}/events/actual-frequency", "config=0x100000")
 
-    def add_pci_ids(self, entries: dict[int, str]) -> None:
-        lines = ["# fake pci.ids", "10de  NVIDIA Corporation", "\t0fe9  GK107M", "8086  Intel Corporation"]
+    def add_pci_ids(self, entries: dict[int, str], nvidia: dict[int, str] | None = None) -> None:
+        nvidia = {0x0FE9: "GK107M"} if nvidia is None else nvidia
+        lines = ["# fake pci.ids", "10de  NVIDIA Corporation"]
+        lines += [f"\t{dev:04x}  {name}" for dev, name in nvidia.items()]
+        lines += ["8086  Intel Corporation"]
         lines += [f"\t{dev:04x}  {name}" for dev, name in entries.items()]
         lines += ["8087  Intel Corporation (other)"]
         self.write("usr/share/hwdata/pci.ids", "\n".join(lines))

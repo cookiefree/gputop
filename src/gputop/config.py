@@ -26,7 +26,7 @@ class Config:
     interval_ms: int = 500
     theme: str = "default"
     mouse: bool = True
-    backend: str = "nvidia"
+    backend: str = "auto"  # auto, nvidia, intel, amd, fake, or a list: "nvidia,intel"
     sort_key: str = "vram"
     sort_reverse: bool = False
     view: str = "all"  # "all" or "detail"

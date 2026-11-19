@@ -45,6 +45,26 @@ MIN_GRAPH_W = 12
 
 _EMPTY = GPUSample(index=-1)
 
+# Status tag colours, as theme keys. In btop's Default theme these are exactly
+# ACTIVE #0de756, SUSPENDED #ffd77a, OFF / NO DRIVER #b54040, UNSUPPORTED #606060.
+STATUS_KEYS = {
+    "ACTIVE": "proc_misc",
+    "SUSPENDED": "available_mid",
+    "OFF": "hi_fg",
+    "NO DRIVER": "hi_fg",
+    "UNSUPPORTED": "graph_text",
+}
+
+
+def status_tab(status: str | None) -> Tab | None:
+    if not status:
+        return None
+    return Tab(f"● {status}", key=STATUS_KEYS.get(status, "graph_text"))
+
+
+def is_live(st: DeviceState) -> bool:
+    return st.latest is None or st.latest.live
+
 
 def throttle_tags(sample: GPUSample | None) -> tuple[list[str], bool]:
     """(short labels, any_warning) for a sample's throttle reasons."""
@@ -186,12 +206,18 @@ class GpuPanel(BoxWidget):
         sup = fmt.superscript(self.hotkey) if self.hotkey is not None and self.hotkey <= 9 else ""
         left = [Tab(f"gpu{st.index}", prefix=sup, selected=self.selected),
                 Tab(fmt.short_gpu_name(st.info.name))]
-        center = right = None
+        if not is_live(st) and st.info.pci_address:
+            left.append(Tab(st.info.pci_address, key="graph_text", bold=False))
+        center = None
+        right: list[Tab] = []
+        tag = status_tab(st.latest.status if st.latest is not None else None)
+        if tag is not None and not st.lost:
+            right.append(tag)
         if self.show_clock:
             left.append(hotkey_tab("help", gap=2))
             center = Tab(time.strftime("%H:%M:%S"))
-            right = [interval_tab(self.interval_ms())]
-        return left, center, right or []
+            right.append(interval_tab(self.interval_ms()))
+        return left, center, right
 
     def bottom_tabs(self):
         st, info = self.state, self.state.info
@@ -200,6 +226,8 @@ class GpuPanel(BoxWidget):
             drv = f"{info.vendor.lower()} {drv}"
         left = [Tab(drv, key="graph_text", bold=False)] if drv else []
         right: list[Tab] = []
+        if not is_live(st):
+            return left, right
         if st.lost:
             right.append(Tab("LOST", key="hi_fg"))
         elif st.error:
@@ -224,6 +252,8 @@ class GpuPanel(BoxWidget):
         s = st.latest
         if s is None:
             return [Text("waiting for data…", th.style("inactive_fg"))]
+        if not s.live:
+            return offline_content(st, th, w, h)
 
         rows = stats_rows(st, th, STATS_W)
         if w < STATS_W + 2 + MIN_GRAPH_W:
@@ -237,6 +267,57 @@ class GpuPanel(BoxWidget):
         panel = stats_panel(rows, th, h, boxed)
         sep = Text(" ", th.base_style)
         return [g + sep + p for g, p in zip(graph, panel)]
+
+
+def offline_content(st: DeviceState, th: Theme, w: int, h: int) -> list[Text]:
+    """A GPU without live stats (off, suspended, no driver, unsupported driver):
+    empty graph and meters in inactive_fg, a centred explanation, static info."""
+    s, info = st.latest or _EMPTY, st.info
+    inactive, label, value = th.style("inactive_fg"), th.style("main_fg"), th.style("title")
+    meter_w = max(1, STATS_W - LABEL_W - 1 - VALUE_W)
+
+    def empty_meter(name: str) -> Text:
+        t = Text(name.ljust(LABEL_W), label)
+        t.append("■" * meter_w, inactive)
+        t.append(" " + "-".rjust(VALUE_W), inactive)
+        return t
+
+    def kv(k: str, v: str) -> Text:
+        t = Text(k.ljust(LABEL_W + 1), label)
+        t.append(v, value)
+        return t
+
+    power = s.power_state or "?"
+    if s.runtime_status and s.runtime_status not in ("active",):
+        power += f" · {s.runtime_status}"
+    rows = [
+        ("util", empty_meter("util")),
+        ("vendor", kv("vendor", f"{info.vendor or '?'}  {info.pci_ids}".rstrip())),
+        ("pci", kv("pci", info.pci_address or "-")),
+        ("driver", kv("driver", s.driver or "none")),
+        ("power", kv("power", power)),
+        ("boot", kv("boot", "boot VGA" if info.boot_vga else "no")),
+    ]
+    rows = [(n, _fit(t, STATS_W, th)) for n, t in rows][:h]
+    message = s.status_detail or (s.status or "no data").lower()
+
+    if w < STATS_W + 2 + MIN_GRAPH_W:  # narrow: info only
+        lines = [_fit(Text(message, th.style("graph_text")), w, th)] + [_fit(r, w, th) for _, r in rows]
+        return lines[:h]
+    boxed = h >= len(rows) + 2
+    gw = w - (STATS_W + 2 if boxed else STATS_W + 1) - 1
+    graph = [Text(" " * gw, th.base_style) for _ in range(h)]
+    if h >= 2:
+        graph[-1] = Text("⣀" * gw, inactive)  # an empty baseline, like an idle graph
+    msg_lines = wrap_words(message, gw)[: max(1, h - 1)]
+    y0 = max(0, (h - 1 - len(msg_lines)) // 2)  # centred above the baseline
+    for i, line in enumerate(msg_lines):
+        graph[y0 + i] = Text(line.center(gw), th.style("graph_text"))
+    if y0 > 0:
+        graph[0] = overlay(graph[0], 0, Text("util", inactive))
+    panel = stats_panel(rows, th, h, boxed)
+    sep = Text(" ", th.base_style)
+    return [g + sep + p for g, p in zip(graph, panel)]
 
 
 def stats_rows(st: DeviceState, th: Theme, width: int) -> list[tuple[str, Text]]:
@@ -423,6 +504,8 @@ class DetailBox(BoxWidget):
         self.state = state
 
     def has_data(self) -> bool:
+        if not is_live(self.state):  # off/suspended: no (stale) graphs
+            return False
         return any(v is not None for m in self.metrics for v in self.state.history[m].tail(512))
 
 

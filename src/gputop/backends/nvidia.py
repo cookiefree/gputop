@@ -11,6 +11,7 @@ import logging
 from collections.abc import Callable
 from typing import Any, TypeVar
 
+from ..pcidiscovery import normalize_address
 from .base import BackendError, DeviceLostError, GPUBackend, GPUInfo, GPUProcess, GPUSample
 
 log = logging.getLogger(__name__)
@@ -45,6 +46,7 @@ class NvidiaBackend(GPUBackend):
     def __init__(self) -> None:
         self._nvml: Any = None
         self._handles: dict[int, Any] = {}
+        self._addr_index: dict[str, int] = {}
         self._initialised = False
         self._driver: str | None = None
         self._proc_util_ts: dict[int, int] = {}
@@ -62,7 +64,14 @@ class NvidiaBackend(GPUBackend):
             ) from exc
         self._nvml = pynvml
         try:
-            pynvml.nvmlInit()
+            # NO_ATTACH: don't attach to (and possibly wake) every GPU at init;
+            # handles are attached one by one, only for GPUs known to be awake.
+            init_flags = getattr(pynvml, "nvmlInitWithFlags", None)
+            no_attach = getattr(pynvml, "NVML_INIT_FLAG_NO_ATTACH", None)
+            if init_flags is not None and no_attach is not None:
+                init_flags(no_attach)
+            else:
+                pynvml.nvmlInit()
         except pynvml.NVMLError as exc:
             raise BackendError(self._explain_init_error(exc)) from exc
         self._initialised = True
@@ -113,6 +122,7 @@ class NvidiaBackend(GPUBackend):
                 pass
         self._initialised = False
         self._handles.clear()
+        self._addr_index.clear()
 
     # -- error handling -------------------------------------------------------
 
@@ -158,25 +168,53 @@ class NvidiaBackend(GPUBackend):
             if h is None:
                 continue
             self._handles[i] = h
-            mem = self._q(lambda: nv.nvmlDeviceGetMemoryInfo(h))
-            limit_max = self._q(lambda: nv.nvmlDeviceGetPowerManagementLimitConstraints(h))
-            devices.append(
-                GPUInfo(
-                    index=i,
-                    name=_decode(self._q(lambda: nv.nvmlDeviceGetName(h)) or f"NVIDIA GPU {i}"),
-                    uuid=_decode(self._q(lambda: nv.nvmlDeviceGetUUID(h)) or ""),
-                    driver_version=self._driver,
-                    vendor="NVIDIA",
-                    memory_total=int(mem.total) if mem is not None else None,
-                    pcie_gen_max=self._q(lambda: nv.nvmlDeviceGetMaxPcieLinkGeneration(h)),
-                    pcie_width_max=self._q(lambda: nv.nvmlDeviceGetMaxPcieLinkWidth(h)),
-                    clock_graphics_max=self._q(lambda: nv.nvmlDeviceGetMaxClockInfo(h, nv.NVML_CLOCK_GRAPHICS)),
-                    clock_sm_max=self._q(lambda: nv.nvmlDeviceGetMaxClockInfo(h, nv.NVML_CLOCK_SM)),
-                    clock_mem_max=self._q(lambda: nv.nvmlDeviceGetMaxClockInfo(h, nv.NVML_CLOCK_MEM)),
-                    power_limit_max=(limit_max[1] / 1000.0) if limit_max else None,
-                )
-            )
+            devices.append(self._info(i, h))
         return devices
+
+    def get_devices_for(self, addresses) -> list[GPUInfo]:
+        """Look GPUs up by PCI bus id, so other (possibly sleeping) GPUs are
+        never enumerated or attached."""
+        if not self._initialised:
+            self.init()
+        nv = self._nvml
+        lookup = getattr(nv, "nvmlDeviceGetHandleByPciBusId_v2", None) or getattr(
+            nv, "nvmlDeviceGetHandleByPciBusId", None)
+        if lookup is None:
+            return super().get_devices_for(addresses)
+        devices = []
+        for addr in addresses:
+            h = self._q(lambda addr=addr: lookup(addr))
+            if h is None:
+                continue
+            index = self._addr_index.setdefault(addr, 1000 + len(self._addr_index))
+            self._handles[index] = h
+            devices.append(self._info(index, h))
+        return devices
+
+    def _info(self, i: int, h) -> GPUInfo:
+        nv = self._nvml
+        mem = self._q(lambda: nv.nvmlDeviceGetMemoryInfo(h))
+        limit_max = self._q(lambda: nv.nvmlDeviceGetPowerManagementLimitConstraints(h))
+        pci_info = self._q(lambda: nv.nvmlDeviceGetPciInfo(h))
+        bus = ""
+        if pci_info is not None:
+            raw = getattr(pci_info, "busId", None) or getattr(pci_info, "busIdLegacy", b"")
+            bus = normalize_address(_decode(raw)) if raw else ""
+        return GPUInfo(
+            index=i,
+            name=_decode(self._q(lambda: nv.nvmlDeviceGetName(h)) or f"NVIDIA GPU {i}"),
+            uuid=_decode(self._q(lambda: nv.nvmlDeviceGetUUID(h)) or ""),
+            driver_version=self._driver,
+            vendor="NVIDIA",
+            memory_total=int(mem.total) if mem is not None else None,
+            pcie_gen_max=self._q(lambda: nv.nvmlDeviceGetMaxPcieLinkGeneration(h)),
+            pcie_width_max=self._q(lambda: nv.nvmlDeviceGetMaxPcieLinkWidth(h)),
+            clock_graphics_max=self._q(lambda: nv.nvmlDeviceGetMaxClockInfo(h, nv.NVML_CLOCK_GRAPHICS)),
+            clock_sm_max=self._q(lambda: nv.nvmlDeviceGetMaxClockInfo(h, nv.NVML_CLOCK_SM)),
+            clock_mem_max=self._q(lambda: nv.nvmlDeviceGetMaxClockInfo(h, nv.NVML_CLOCK_MEM)),
+            power_limit_max=(limit_max[1] / 1000.0) if limit_max else None,
+            pci_address=bus,
+        )
 
     # -- sampling -------------------------------------------------------------
 

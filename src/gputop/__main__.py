@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from . import __version__
-from .backends import BACKEND_NAMES, BackendError, GPUBackend, create_backend
+from .backends import BackendError, GPUBackend, build_backend, parse_backend_spec
 from .config import Config, config_dir
 from .sampler import Sampler
 
@@ -38,6 +38,14 @@ def _interval(value: str) -> int:
     return ms
 
 
+def _backend_spec(value: str) -> str:
+    try:
+        parse_backend_spec(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="gputop",
@@ -48,9 +56,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--theme", metavar="NAME", help="theme name or path to a .theme/.toml file")
     p.add_argument("--gpu", type=_gpu_list, metavar="INDEX[,INDEX...]", help="only show these GPUs")
     p.add_argument("--no-mouse", action="store_true", help="disable mouse support")
-    p.add_argument("--backend", choices=BACKEND_NAMES,
-                   help="data source: nvidia (default), intel, auto (every available backend), "
-                        "fake (synthetic, no GPU needed)")
+    p.add_argument("--backend", type=_backend_spec, metavar="NAME[,NAME...]",
+                   help="auto (default: every backend that works), nvidia, intel, amd, a list like "
+                        "nvidia,intel (forced), or fake (synthetic, no GPU needed)")
+    p.add_argument("--no-pci", action="store_true",
+                   help="don't show GPUs found only by PCI discovery (off, suspended, no driver)")
+    p.add_argument("--sysfs-root", default="/", help=argparse.SUPPRESS)  # tests: fake sysfs tree
     p.add_argument("--color", choices=("auto", "truecolor", "256", "16"),
                    help="force a colour mode (default: detect from $COLORTERM/$TERM)")
     p.add_argument("--fake-gpus", type=int, default=2, metavar="N", help="number of GPUs for --backend fake")
@@ -66,25 +77,50 @@ def _err(msg: str) -> None:
     print(f"gputop: error: {msg}", file=sys.stderr)
 
 
-def _open_backend(name: str, args: argparse.Namespace) -> GPUBackend:
-    options = {"count": args.fake_gpus, "seed": None} if name == "fake" else {}
-    backend = create_backend(name, **options)
+def _open_backend(spec: str, args: argparse.Namespace) -> GPUBackend:
+    backend = build_backend(spec, use_pci=not args.no_pci, root=args.sysfs_root, fake_count=args.fake_gpus)
     backend.init()
     return backend
 
 
+def _status_fields(sampler: Sampler, dev) -> dict:
+    """status / driver / power_state / live_stats_available for --list/--once."""
+    s = dev.latest
+    if s is None:
+        return {"status": "UNKNOWN", "driver": None, "power_state": None, "live_stats_available": False}
+    return {
+        "status": s.status or ("ACTIVE" if s.live else "UNKNOWN"),
+        "driver": s.driver,
+        "power_state": s.power_state,
+        "runtime_status": s.runtime_status,
+        "status_detail": s.status_detail,
+        "live_stats_available": bool(s.live),
+    }
+
+
 def cmd_list(sampler: Sampler) -> int:
     for name, reason in getattr(sampler.backend, "skipped", {}).items():
-        print(f"gputop: note: {name} backend skipped: {reason}", file=sys.stderr)
+        print(f"gputop: note: {name} backend not used: {reason}", file=sys.stderr)
+    sampler.poll_once()  # status of every GPU (cheap PCI reads; live GPUs sampled once)
     devices = sampler.devices
     if not devices:
         print("no GPUs found")
         return 1
     for dev in devices:
         i = dev.info
+        st = _status_fields(sampler, dev)
         parts = [f"GPU {i.index}: {i.name}"]
-        if i.short_uuid:
+        if i.pci_address:
+            parts.append(i.pci_address)
+        elif i.short_uuid:
             parts.append(i.short_uuid)
+        state = st["status"]
+        if st["driver"]:
+            state += f" ({st['driver']}"
+            state += f", {st['power_state']})" if st["power_state"] else ")"
+        elif st["power_state"]:
+            state += f" ({st['power_state']})"
+        parts.append(state)
         if i.memory_total:
             parts.append(f"{i.memory_total / 1024**3:.1f} GiB")
         if i.pcie_gen_max:
@@ -99,10 +135,16 @@ def cmd_once(sampler: Sampler, backend_name: str) -> int:
     sampler.poll_once()
     gpus = []
     for dev in sampler.devices:
+        info = dev.info
         gpus.append(
             {
-                "info": dev.info.to_dict(),
-                "sample": dev.latest.to_dict() if dev.latest else None,
+                "index": info.index,
+                "name": info.name,
+                "vendor": info.vendor,
+                "pci_address": info.pci_address or None,
+                **_status_fields(sampler, dev),
+                "info": info.to_dict(),
+                "sample": dev.latest.to_dict() if dev.latest and dev.latest.live else None,
                 "processes": [p.to_dict() for p in dev.processes],
                 "lost": dev.lost,
                 "error": dev.error,
@@ -110,7 +152,7 @@ def cmd_once(sampler: Sampler, backend_name: str) -> int:
         )
     out: dict = {"timestamp": time.time(), "backend": backend_name, "gpus": gpus}
     active = getattr(sampler.backend, "active", None)
-    if active is not None:  # --backend auto
+    if active is not None:
         out["backends"] = [name for name, _ in active]
     json.dump(out, sys.stdout, indent=2)
     sys.stdout.write("\n")
@@ -145,7 +187,7 @@ def main(argv: list[str] | None = None) -> int:
             if missing:
                 _err(f"no GPU with index {', '.join(map(str, missing))}")
                 return 1
-        if not sampler.devices and not args.list:
+        if not sampler.devices:
             _err("no GPUs found")
             return 1
 
@@ -195,6 +237,10 @@ def run_tui(args: argparse.Namespace, cfg: Config, cfg_path: Path | None, sample
             signal.signal(sig, _graceful)
         except (ValueError, OSError):  # not on the main thread / unsupported
             pass
+    try:  # `kill -USR1 <pid>`: re-run GPU discovery (e.g. after a hotplug)
+        signal.signal(signal.SIGUSR1, lambda signum, frame: app.request_rediscover())
+    except (ValueError, OSError, AttributeError):
+        pass
 
     try:
         app.run(mouse=not args.no_mouse and cfg.mouse)

@@ -124,9 +124,10 @@ def test_engine_busy_deltas(tree):
 def test_util_from_video_engine_when_no_render_engine(tree):
     igpu(tree).add_pmu(engines={"vcs0": 0x200000, "vcs1": 0x200001})
     b = make(tree)
+    (dev,) = b.get_devices()  # counters open (and are primed) on first use
     tree.clock.advance(1.0)
     tree.pmu_values = {0x200000: 100_000_000, 0x200001: 300_000_000}
-    s = b.sample(b.get_devices()[0])
+    s = b.sample(dev)
     assert s.util_gpu == 30.0
     assert set(s.engine_util) == {"video", "video1"}
 
@@ -160,8 +161,19 @@ def test_discrete_card_uses_its_own_named_pmu(tree):
     tree.add_card(0, pci=DGPU)
     tree.add_pmu(name="i915")  # belongs to the iGPU, must not be used
     tree.add_pmu(name="i915_0000_03_00.0", engines={"rcs0": 0x7})
-    make(tree)
+    make(tree).get_devices()
     assert [c.config for c in tree.counters] == [0x7]
+
+
+def test_per_card_setup_is_deferred_until_queried(tree):
+    """init() only enumerates cards; sensors/PMU are set up on first query."""
+    igpu(tree).add_pmu()
+    b = make(tree)
+    assert tree.counters == []
+    assert b.get_devices_for(["0000:99:00.0"]) == []
+    assert tree.counters == []  # a card that wasn't asked for is never touched
+    b.get_devices_for([IGPU])
+    assert len(tree.counters) == 3
 
 
 # -- power -----------------------------------------------------------------------

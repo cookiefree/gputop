@@ -21,6 +21,7 @@ HELP_KEYS: tuple[tuple[str, str], ...] = (
     ("Home / End", "first / last process"),
     ("s", "cycle process sort column"),
     ("r", "reverse sort order"),
+    ("R", "re-run GPU discovery (or: kill -USR1 <pid>)"),
     ("f", "filter processes (Enter keeps, Esc clears)"),
     ("+ / -", "refresh interval faster / slower (100 ms - 5 s)"),
     ("t", "cycle colour theme"),
@@ -43,7 +44,7 @@ class HelpBox(BoxWidget):
     def __init__(self, theme: Theme, extra: str = "", **kwargs) -> None:
         super().__init__(theme, **kwargs)
         self.extra = extra
-        self.styles.height = len(HELP_KEYS) + 2 + (2 if extra else 0) + 2
+        self.styles.height = len(HELP_KEYS) + 2 + (2 if extra else 0) + 2  # rows + padding + borders
 
     def top_tabs(self):
         return [Tab("help", hotkey=0)], None, []

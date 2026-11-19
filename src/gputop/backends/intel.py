@@ -253,6 +253,7 @@ class _Card:
     engines: EngineBusyReader | None = None
     notes: tuple[str, ...] = ()
     throttle_dir: Path | None = None
+    ready: bool = False  # per-card setup done (only ever for awake cards)
 
 
 @dataclass
@@ -324,6 +325,7 @@ class IntelBackend(GPUBackend):
             if card.engines is not None:
                 card.engines.close()
                 card.engines = None
+            card.ready = False
         self._initialised = False
 
     # -- discovery ------------------------------------------------------------
@@ -360,6 +362,14 @@ class IntelBackend(GPUBackend):
         card.freq_max = [sys_dir / "gt_max_freq_mhz", gt / "rps_max_freq_mhz", xe / "max_freq"]
         if (gt / "throttle_reason_status").exists():
             card.throttle_dir = gt
+        return card
+
+    def _ensure(self, card: _Card) -> None:
+        """Per-card setup (sensors, energy counters, PMU). Deferred until the
+        card is actually queried, which only happens while it is awake: a
+        hwmon read or perf event on a runtime-suspended GPU can wake it."""
+        if card.ready:
+            return
         card.temp = self._find_temp(card)
         card.energy = self._find_energy(card)
         notes = []
@@ -369,7 +379,7 @@ class IntelBackend(GPUBackend):
         if card.energy is not None and card.energy.label == "package":
             notes.append("power shown is the whole CPU package (no GPU RAPL domain)")
         card.notes = tuple(notes)
-        return card
+        card.ready = True
 
     def _find_temp(self, card: _Card) -> Path | None:
         # Discrete cards: their own hwmon.
@@ -501,9 +511,20 @@ class IntelBackend(GPUBackend):
     def get_devices(self) -> list[GPUInfo]:
         if not self._initialised:
             self.init()
+        return self._infos(self._cards)
+
+    def get_devices_for(self, addresses) -> list[GPUInfo]:
+        """Only the cards at ``addresses``; other cards are not touched."""
+        if not self._initialised:
+            self.init()
+        want = set(addresses)
+        return self._infos([c for c in self._cards if c.pci in want])
+
+    def _infos(self, cards: list[_Card]) -> list[GPUInfo]:
         release = _read(self._p("/proc/sys/kernel/osrelease")) or platform.release()
         out = []
-        for card in self._cards:
+        for card in cards:
+            self._ensure(card)
             gen = width = None
             if not card.integrated:
                 gen = self._link_gen(_read(card.dev / "max_link_speed"))
@@ -520,6 +541,7 @@ class IntelBackend(GPUBackend):
                     pcie_width_max=width,
                     clock_graphics_max=_first_int(card.freq_max),
                     power_limit_max=card.energy.limit_w if card.energy else None,
+                    pci_address=card.pci,
                 )
             )
         return out
@@ -542,6 +564,7 @@ class IntelBackend(GPUBackend):
 
     def sample(self, device: GPUInfo) -> GPUSample:
         card = self._card(device)
+        self._ensure(card)
         s = GPUSample(index=device.index, notes=card.notes)
 
         act = _first_int(card.freq_act)
