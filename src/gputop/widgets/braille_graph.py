@@ -71,6 +71,7 @@ def render_graph(
     vmax: float = 100.0,
     invert: bool = False,
     baseline: bool = True,
+    smooth: bool = True,
 ) -> list[list[Cell]]:
     """Render ``values`` (oldest first) into ``height`` rows of ``width`` cells.
 
@@ -85,6 +86,13 @@ def render_graph(
     green -> yellow -> red bands).
 
     ``invert`` draws from the top edge downwards (btop's upload graph).
+
+    ``smooth`` treats the samples as a polyline: each dot column is filled up
+    to the highest point of the line within half a sample on either side, i.e.
+    ``max(v[i], (v[i-1]+v[i])/2, (v[i]+v[i+1])/2)``. A lone spike becomes a
+    triangle instead of a one-dot-wide comb tooth, rises and falls slope
+    instead of stepping, and peaks keep their height. Samples next to a gap
+    (``None``) are not interpolated across it.
     """
     if width <= 0 or height <= 0:
         return [[] for _ in range(max(0, height))]
@@ -94,10 +102,23 @@ def render_graph(
     tail = [None] * (n - len(tail)) + tail
     total_dots = height * 4
 
+    fracs = [_normalise(v, vmin, vmax) for v in tail]
+    if smooth:
+        smoothed: list[float | None] = []
+        for i, f in enumerate(fracs):
+            if f is None:
+                smoothed.append(None)
+                continue
+            top = f
+            for j in (i - 1, i + 1):
+                if 0 <= j < n and fracs[j] is not None:
+                    top = max(top, (f + fracs[j]) / 2)
+            smoothed.append(top)
+        fracs = smoothed
+
     dots: list[int] = []
     norms: list[float] = []
-    for v in tail:
-        f = _normalise(v, vmin, vmax)
+    for f in fracs:
         if f is None:
             dots.append(0)
             norms.append(0.0)

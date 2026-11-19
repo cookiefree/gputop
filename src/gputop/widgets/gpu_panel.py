@@ -225,6 +225,12 @@ class GpuPanel(BoxWidget):
         if drv[:1].isdigit() and info.vendor:
             drv = f"{info.vendor.lower()} {drv}"
         left = [Tab(drv, key="graph_text", bold=False)] if drv else []
+        notes = st.latest.notes if st.latest is not None and st.latest.live else ()
+        if notes:
+            # Hints like "util hidden: needs kernel.perf_event_paranoid=0" live
+            # in the bottom border, never over a graph. First, so they win over
+            # the driver tag when space is short (long tabs get an ellipsis).
+            left.insert(0, Tab(f"⚠ {notes[0]}", key="graph_text", bold=False, marks={0: "hi_fg"}))
         right: list[Tab] = []
         if not is_live(st):
             return left, right
@@ -474,17 +480,14 @@ def graph_area(st: DeviceState, th: Theme, w: int, h: int, util_only: bool = Fal
     if has_util:
         out += labelled_graph(hist["util_gpu"].tail(w * 2), w, uh, th, "util", 100.0, Text("util", gt))
     else:
-        # No utilisation (e.g. Intel without perf access): explain why, and show
-        # the clock history instead, which still reflects GPU activity.
-        hint = [Text(line, th.style("inactive_fg")) for line in wrap_words(s.notes[0], w)] if s.notes else []
-        hint = hint[: max(0, uh - 1)] if s.clock_graphics is not None else hint[:uh]
-        gh = uh - len(hint)
-        if gh > 0 and s.clock_graphics is not None:
+        # No utilisation (e.g. Intel without perf access; the reason is shown in
+        # the box's bottom border): the clock history stands in for it, since
+        # it still reflects GPU activity.
+        if s.clock_graphics is not None:
             vmax = float(info.clock_graphics_max or hist["clock_graphics"].max() or 1)
-            out += [_fit(t, w, th) for t in hint]
-            out += labelled_graph(hist["clock_graphics"].tail(w * 2), w, gh, th, "util", vmax, Text("clk", gt))
+            out += labelled_graph(hist["clock_graphics"].tail(w * 2), w, uh, th, "util", vmax, Text("clk", gt))
         else:
-            out += [_fit(t, w, th) for t in hint] + [Text(" " * w, th.base_style)] * (uh - len(hint))
+            out += [Text(" " * w, th.base_style)] * uh
     if ph > 0:
         vmax = s.power_limit or info.power_limit_max or hist["power_draw"].max() or 1.0
         out += labelled_graph(hist["power_draw"].tail(w * 2), w, ph, th, "power", vmax, Text("power", gt))

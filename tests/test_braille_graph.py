@@ -11,6 +11,8 @@ from gputop.widgets.meter import EMPTY, FULL, meter_text, render_meter
 
 
 def strings(*args, **kwargs):
+    """Raw sample -> dots mapping (smoothing tested separately below)."""
+    kwargs.setdefault("smooth", False)
     return graph_to_strings(render_graph(*args, **kwargs))
 
 
@@ -95,7 +97,7 @@ def test_dimensions():
 
 
 def test_colour_positions_single_row_follow_value():
-    rows = render_graph([10, 10, 90, 90], width=2)
+    rows = render_graph([10, 10, 90, 90], width=2, smooth=False)
     (_, low), (_, high) = rows[0]
     assert low == pytest.approx(0.1)
     assert high == pytest.approx(0.9)
@@ -110,7 +112,7 @@ def test_colour_positions_multi_row_follow_height():
 def test_graph_text_applies_gradient():
     theme = Theme("default")
     lines = graph_text([0, 0, 100, 100], 2, 1, theme.gradient("util"))
-    assert lines[0].plain == "⣀⣿"
+    assert lines[0].plain == "⣠⣿"  # smoothed: the rise slopes
     spans = lines[0].spans
     assert len(spans) == 2
     assert spans[0].style.color != spans[1].style.color
@@ -142,3 +144,70 @@ def test_meter_gradient_positions():
 def test_meter_text_width():
     t = meter_text(0.3, 12, Theme("default"))
     assert len(t.plain) == 12
+
+
+# -- filled, smoothed area graph ------------------------------------------------
+
+
+def dot_heights(rows, invert=False):
+    """Filled dots per dot column, decoded back from the braille characters,
+    asserting every column is solid from the base up (no holes, no combing)."""
+    height = len(rows)
+    width = len(rows[0])
+    cols = [0] * (width * 2)
+    left_up, right_up = (0x40, 0x04, 0x02, 0x01), (0x80, 0x20, 0x10, 0x08)
+    left_dn, right_dn = (0x01, 0x02, 0x04, 0x40), (0x08, 0x10, 0x20, 0x80)
+    base_first = range(height) if invert else range(height - 1, -1, -1)  # walk up from the base
+    for r in base_first:
+        level = r if invert else height - 1 - r
+        for c, (ch, _) in enumerate(rows[r]):
+            bits = 0 if ch == " " else ord(ch) - 0x2800
+            for side, order in ((0, left_dn if invert else left_up), (1, right_dn if invert else right_up)):
+                filled = [bool(bits & b) for b in order]
+                n = sum(filled)
+                assert filled == [True] * n + [False] * (4 - n), f"hole in cell {r},{c}: {ch!r}"
+                if n:
+                    assert cols[2 * c + side] == level * 4, f"gap below cell {r},{c}"
+                    cols[2 * c + side] = level * 4 + n
+    return cols
+
+
+def test_filled_columns_have_no_holes():
+    vals = [0, 100, 0, 37, 80, 80, 5, 60, 20, 90, 100, 0]
+    for h in (1, 2, 5):
+        for invert in (False, True):
+            dot_heights(render_graph(vals, 6, h, invert=invert), invert)
+
+
+def test_lone_spike_becomes_a_triangle_not_a_comb_tooth():
+    vals = [0] * 5 + [100] + [0] * 6  # 12 samples -> 6 cells, height 2 (8 dots)
+    raw = dot_heights(render_graph(vals, 6, 2, smooth=False))
+    smooth = dot_heights(render_graph(vals, 6, 2))
+    assert raw == [1, 1, 1, 1, 1, 8, 1, 1, 1, 1, 1, 1]  # one-dot-wide tooth
+    assert smooth == [1, 1, 1, 1, 4, 8, 4, 1, 1, 1, 1, 1]  # neighbours slope up
+    assert max(smooth) == 8  # the peak keeps its height
+
+
+def test_rise_slopes_instead_of_stepping():
+    vals = [0, 0, 0, 0, 100, 100, 100, 100]
+    assert dot_heights(render_graph(vals, 4, 2)) == [1, 1, 1, 4, 8, 8, 8, 8]
+
+
+def test_two_samples_per_cell():
+    vals = list(range(0, 100, 5))  # 20 samples
+    rows = render_graph(vals, 10, 3)
+    assert all(len(r) == 10 for r in rows)
+    heights = dot_heights(rows)
+    assert len(heights) == 20 and heights == sorted(heights)
+
+
+def test_smoothing_does_not_bridge_gaps():
+    vals = [100, None, None, 100]
+    assert dot_heights(render_graph(vals, 2, 1)) == [4, 0, 0, 4]
+
+
+def test_vertical_gradient_bottom_to_top():
+    rows = render_graph([100] * 4, 2, 4)
+    positions = [row[0][1] for row in rows]
+    assert positions == sorted(positions, reverse=True)  # top row = gradient end
+    assert positions[0] == 1.0
